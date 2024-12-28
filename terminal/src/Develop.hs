@@ -9,7 +9,7 @@ module Develop
   where
 
 import Control.Applicative ((<|>))
-import Control.Monad (guard)
+import Control.Monad (guard, when)
 import Control.Monad.Trans (MonadIO(liftIO))
 -- import qualified Control.Monad.Catch
 import qualified Control.Exception.Lifted
@@ -60,6 +60,7 @@ import StandaloneInstances
 data Flags =
   Flags
     { _port :: Maybe Int
+    , _debug :: Bool
     }
 
 
@@ -67,11 +68,12 @@ run :: () -> Flags -> IO ()
 run () flags = do
   root <- getProjectRoot "Develop.run"
   Dir.setCurrentDirectory root
+  when (_debug flags) $ setEnv "LDEBUG" "1"
   runWithRoot root flags
 
 
 runWithRoot :: FilePath -> Flags -> IO ()
-runWithRoot root (Flags maybePort) =
+runWithRoot root (Flags maybePort debug) =
   do
       Lamdera.setLiveMode True
       let port = maybe 8000 id maybePort

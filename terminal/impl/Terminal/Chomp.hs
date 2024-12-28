@@ -396,22 +396,12 @@ findFlagHelp revPrev loneFlag flagPrefix chunks =
       Nothing
 
     chunk@(Chunk index string) : rest ->
-      if List.isPrefixOf flagPrefix string then
+      if string == loneFlag then
+        succeed DefNope rest
+      else if List.isPrefixOf flagPrefix string then
         succeed (Definitely index (deprefix string)) rest
-
-      else if string /= loneFlag then
-        findFlagHelp (chunk:revPrev) loneFlag flagPrefix rest
-
       else
-        case rest of
-          [] ->
-            succeed DefNope []
-
-          argChunk@(Chunk _ potentialArg) : restOfRest ->
-            if List.isPrefixOf "-" potentialArg then
-              succeed DefNope rest
-            else
-              succeed (Possibly argChunk) restOfRest
+        findFlagHelp (chunk:revPrev) loneFlag flagPrefix rest
 
 
 

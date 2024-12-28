@@ -37,6 +37,7 @@ live =
     liveFlags =
       flags Develop.Flags
         |-- flag "port" port_ "The port of the server (default: 8000)"
+        |-- onOff "debug" "Enable debug mode"
   in
   Terminal.Command "live" (Common summary) details example noArgs liveFlags Develop.run
 

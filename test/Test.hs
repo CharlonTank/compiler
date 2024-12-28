@@ -41,6 +41,51 @@ import qualified Ext.Query.Canonical
 
 import Develop
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar, TVar)
+import Control.Exception (finally, throw)
+import Control.Monad (guard, when)
+import Control.Monad.Trans (MonadIO(liftIO))
+import qualified Control.Exception.Lifted
+import qualified Data.ByteString.Builder as B
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BSL
+import qualified Data.HashMap.Strict as HashMap
+import Data.Monoid ((<>))
+import qualified Data.NonEmptyList as NE
+import System.FilePath as FP
+import Snap.Core hiding (path)
+import Snap.Http.Server
+import Snap.Util.FileServe
+
+import qualified BackgroundWriter as BW
+import qualified Build
+import qualified Elm.Details as Details
+import qualified Develop.Generate.Help as Help
+import qualified Develop.Generate.Index as Index
+import qualified Develop.StaticFiles as StaticFiles
+import qualified Generate.Html as Html
+import qualified Generate
+import qualified Reporting
+import qualified Reporting.Exit as Exit
+import qualified Reporting.Task as Task
+import qualified Stuff
+
+import Lamdera
+import qualified Lamdera.CLI.Live as Live
+import qualified Lamdera.Constrain
+import qualified Lamdera.ReverseProxy
+import qualified Lamdera.TypeHash
+import qualified Lamdera.PostCompile
+
+import qualified Data.List as List
+import Ext.Common (trackedForkIO, whenDebug)
+import qualified Ext.Filewatch as Filewatch
+import qualified Ext.Sentry as Sentry
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar, TVar)
+
+import StandaloneInstances
+
 
 {-
 
@@ -124,8 +169,9 @@ checkProjectCompiles = do
 liveReloadLive = do
   setEnv "LDEBUG" "1"
   setEnv "EXPERIMENTAL" "1"
-  let p = "test/scenario-alltypes"
-  trackedForkIO "Test.liveReloadLive" $ Develop.runWithRoot p (Develop.Flags Nothing)
+  let p = "test/data/live-reload"
+  trackedForkIO "Test.liveReloadLive" $ Develop.runWithRoot p (Develop.Flags Nothing False)
+  threadDelay 1000000
 
   -- Doing this actually makes no sense in the :rr context, as the thread is long-running so it's the same as
   -- disabling the ENV vars mid-run! But leaving it here as a reminder, because it _does_ pollute the ENV

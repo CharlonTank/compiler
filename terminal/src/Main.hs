@@ -168,6 +168,7 @@ reactor =
     reactorFlags =
       flags Develop.Flags
         |-- flag "port" port_ "The port of the server (default: 8000)"
+        |-- onOff "debug" "Enable debug mode"
   in
   Terminal.Command "reactor" (Common summary) details example noArgs reactorFlags Develop.run
 
