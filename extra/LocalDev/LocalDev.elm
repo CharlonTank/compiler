@@ -19,7 +19,7 @@ port module LocalDev exposing (main)
 
 import Backend
 import Browser
-import Bytes
+import Bytes exposing (Bytes)
 import Env
 import Frontend
 import Html exposing (..)
@@ -33,6 +33,90 @@ import Lamdera.Wire3 as Wire exposing (Bytes)
 import Process
 import Task exposing (Task)
 import Types exposing (BackendModel, BackendMsg, FrontendModel, FrontendMsg, ToBackend, ToFrontend)
+
+-- ADD A NEW TYPE FOR OUR HISTORY
+type alias FrontendId =
+    { sessionId : String
+    , clientId : String
+    }
+
+type alias HistoryEntry =
+    { kind : MsgKind
+    , msg : String
+    , fem : FrontendModel
+    , bem : Maybe BackendModel
+    , source : Maybe FrontendId  -- Which frontend sent this message
+    , target : Maybe FrontendId  -- For ToFrontend messages, which frontend it's targeting
+    , timestamp : Int            -- To order messages across frontends
+    }
+
+type MsgKind
+    = KindFrontend
+    | KindBackend
+    | KindToFrontend
+    | KindToBackend
+
+type Location
+    = TopLeft
+    | TopRight
+    | BottomRight
+    | BottomLeft
+
+next : Location -> Location
+next location =
+    case location of
+        TopLeft ->
+            TopRight
+
+        TopRight ->
+            BottomRight
+
+        BottomRight ->
+            BottomLeft
+
+        BottomLeft ->
+            TopLeft
+
+userFrontendApp =
+    Frontend.app
+
+userBackendApp =
+    Backend.app
+
+type VersionCheck
+    = VersionUnchecked
+    | VersionCheckFailed LD.Posix
+    | VersionCheckSucceeded String LD.Posix
+
+type alias Model =
+    { fem : FrontendModel
+    , bem : BackendModel
+    , bemDirty : Bool
+    , originalUrl : Url
+    , originalKey : Key
+    , sessionId : String
+    , clientId : String
+    , nodeType : NodeType
+    , devbar : DevBar
+    , history : List HistoryEntry
+    , currentIndex : Int
+    , timeTravelOpen : Bool
+    , debuggerWindowOpen : Bool  -- Add this field
+    }
+
+type alias DevBar =
+    { expanded : Bool
+    , location : Location
+    , freeze : Bool
+    , networkDelay : Bool
+    , logging : Bool
+    , liveStatus : LiveStatus
+    , showModeChanger : Bool
+    , showResetNotification : Bool
+    , versionCheck : VersionCheck
+    , qrCodeShow : Bool
+    , snapshotFilenames : List String
+    }
 
 
 
@@ -111,11 +195,12 @@ type Msg
     | FEtoBE Types.ToBackend
     | FEtoBEDelayed Types.ToBackend
     | FENewUrl Url
-    | OnConnection ConnectionMsg
-    | OnDisconnection ConnectionMsg
-    | ReceivedToBackend ( SessionId, ClientId, Bytes )
-    | ReceivedToFrontend WireMsg
+    | OnConnection { s : String, c : String }
+    | OnDisconnection { s : String, c : String }
+    | ReceivedToBackend ( String, String, Bytes )
+    | ReceivedToFrontend { t : String, b : Bytes, s : String, c : String }
     | ReceivedBackendModel Bytes
+    | ReceivedFrontendMsg { s : String, c : String, msg : String }  -- New variant
     | RPCIn Json.Value
     | SetNodeTypeLeader Bool
     | SetLiveStatus Bool
@@ -139,6 +224,8 @@ type Msg
     | ModelResetCleared
     | VersionCheck LD.Posix
     | VersionCheckResult (Result LD.HttpError VersionCheck)
+    -- Time Travel Messages
+    | ToggleTimeTravel
       -- Snapshots
     | LoadLatestSnapshotFilename
     | LoadLatestSnapshotFilenamesResult (Result LD.HttpError (List String))
@@ -147,70 +234,7 @@ type Msg
     | LoadedSnapshot (Result LD.HttpError ( Bytes, Int ))
     | LoadedSnapshotLegacy (Result LD.HttpError ( List Int, Int ))
     | Noop
-
-
-type alias Model =
-    { fem : FrontendModel
-    , bem : BackendModel
-    , bemDirty : Bool
-    , originalUrl : Url
-    , originalKey : Key
-    , sessionId : String
-    , clientId : String
-    , nodeType : NodeType
-    , devbar : DevBar
-    }
-
-
-type alias DevBar =
-    { expanded : Bool
-    , location : Location
-    , freeze : Bool
-    , networkDelay : Bool
-    , logging : Bool
-    , liveStatus : LiveStatus
-    , showModeChanger : Bool
-    , showResetNotification : Bool
-    , versionCheck : VersionCheck
-    , qrCodeShow : Bool
-    , snapshotFilenames : List String
-    }
-
-
-type VersionCheck
-    = VersionUnchecked
-    | VersionCheckFailed LD.Posix
-    | VersionCheckSucceeded String LD.Posix
-
-
-type Location
-    = TopLeft
-    | TopRight
-    | BottomRight
-    | BottomLeft
-
-
-next location =
-    case location of
-        TopLeft ->
-            TopRight
-
-        TopRight ->
-            BottomRight
-
-        BottomRight ->
-            BottomLeft
-
-        BottomLeft ->
-            TopLeft
-
-
-userFrontendApp =
-    Frontend.app
-
-
-userBackendApp =
-    Backend.app
+    | JumpTo Int
 
 
 type alias Flags =
@@ -345,6 +369,10 @@ init flags url key =
       , sessionId = flags.s
       , clientId = flags.c
       , devbar = devbar
+      , history = []
+      , currentIndex = 0
+      , timeTravelOpen = False
+      , debuggerWindowOpen = False  -- Initialize as closed
       }
     , Cmd.batch
         [ Cmd.map FEMsg newFeCmds
@@ -391,12 +419,15 @@ update msg m =
         log t v =
             if m.devbar.logging then
                 Debug.log t v
-
             else
                 v
+
+        withDebugger ( model, cmd ) =
+            ( model
+            , Cmd.batch [ cmd, sendToDebugger model ]
+            )
     in
-    -- case Debug.log "msg" msg of
-    case msg of
+    withDebugger <| case msg of
         FEMsg frontendMsg ->
             let
                 x =
@@ -404,8 +435,30 @@ update msg m =
 
                 ( newFem, newFeCmds ) =
                     userFrontendApp.update frontendMsg m.fem
+
+                -- Record in the history (only Leader keeps full history)
+                newHistoryEntry =
+                    { kind = KindFrontend
+                    , msg = Debug.toString frontendMsg
+                    , fem = newFem
+                    , bem = if m.nodeType == Leader then Just m.bem else Nothing
+                    , source = Just { sessionId = m.sessionId, clientId = m.clientId }
+                    , target = Nothing
+                    , timestamp = 0
+                    }
+
+                updatedHistory =
+                    if m.currentIndex < List.length m.history then
+                        -- If we're in the middle of history, truncate it
+                        List.take m.currentIndex m.history ++ [ newHistoryEntry ]
+                    else
+                        m.history ++ [ newHistoryEntry ]
             in
-            ( { m | fem = storeFE m newFem }
+            ( { m 
+                | fem = storeFE m newFem
+                , history = updatedHistory
+                , currentIndex = List.length updatedHistory
+              }
             , Cmd.map FEMsg newFeCmds
             )
 
@@ -422,12 +475,33 @@ update msg m =
 
                         ( newBem, newBeCmds ) =
                             userBackendApp.update backendMsg m.bem
+
+                        newHistoryEntry =
+                            { kind = KindBackend
+                            , msg = Debug.toString backendMsg
+                            , fem = m.fem
+                            , bem = Just newBem
+                            , source = Nothing
+                            , target = Nothing
+                            , timestamp = 0
+                            }
+
+                        updatedHistory =
+                            if m.currentIndex < List.length m.history then
+                                -- If we're in the middle of history, truncate it
+                                List.take m.currentIndex m.history ++ [ newHistoryEntry ]
+                            else
+                                m.history ++ [ newHistoryEntry ]
                     in
-                    ( { m | bem = newBem, bemDirty = True }
-                    , Cmd.batch
-                        [ Cmd.map BEMsg newBeCmds
-                        ]
-                    )
+                    withDebugger <|
+                        ( { m 
+                            | bem = newBem
+                            , bemDirty = True
+                            , history = updatedHistory
+                            , currentIndex = List.length updatedHistory
+                          }
+                        , Cmd.map BEMsg newBeCmds
+                        )
 
         BEtoFE clientId toFrontend ->
             case m.nodeType of
@@ -439,12 +513,30 @@ update msg m =
                     let
                         _ =
                             log " ◀️B " toFrontend
+
+                        newHistoryEntry =
+                            { kind = KindToFrontend
+                            , msg = Debug.toString toFrontend
+                            , fem = m.fem
+                            , bem = Just m.bem
+                            , source = Nothing
+                            , target = Just { sessionId = "", clientId = clientId }
+                            , timestamp = 0
+                            }
+
+                        updatedHistory =
+                            if m.currentIndex < List.length m.history then
+                                -- If we're in the middle of history, truncate it
+                                List.take m.currentIndex m.history ++ [ newHistoryEntry ]
+                            else
+                                m.history ++ [ newHistoryEntry ]
                     in
                     if m.devbar.networkDelay then
-                        ( m, delay 500 (BEtoFEDelayed clientId toFrontend) )
-
+                        ( { m | history = updatedHistory, currentIndex = List.length updatedHistory }
+                        , delay 500 (BEtoFEDelayed clientId toFrontend)
+                        )
                     else
-                        ( m
+                        ( { m | history = updatedHistory, currentIndex = List.length updatedHistory }
                         , Cmd.batch
                             [ send_ToFrontend
                                 { t = "ToFrontend", b = toFrontend |> Types.w3_encode_ToFrontend |> Wire.bytesEncode, s = "", c = clientId }
@@ -465,15 +557,36 @@ update msg m =
                     )
 
         FEtoBE toBackend ->
-            if m.devbar.networkDelay then
-                ( m, delay 500 (FEtoBEDelayed toBackend) )
+            let
+                newHistoryEntry =
+                    { kind = KindToBackend
+                    , msg = Debug.toString toBackend
+                    , fem = m.fem
+                    , bem = if m.nodeType == Leader then Just m.bem else Nothing
+                    , source = Just { sessionId = m.sessionId, clientId = m.clientId }
+                    , target = Nothing
+                    , timestamp = 0
+                    }
 
+                updatedHistory =
+                    if m.currentIndex < List.length m.history then
+                        -- If we're in the middle of history, truncate it
+                        List.take m.currentIndex m.history ++ [ newHistoryEntry ]
+                    else
+                        m.history ++ [ newHistoryEntry ]
+            in
+            if m.devbar.networkDelay then
+                ( { m | history = updatedHistory, currentIndex = List.length updatedHistory }
+                , delay 500 (FEtoBEDelayed toBackend)
+                )
             else
                 let
                     _ =
                         log "F▶️  " toBackend
                 in
-                ( m, Cmd.batch [ send_ToBackend (Wire.bytesEncode (Types.w3_encode_ToBackend toBackend)) ] )
+                ( { m | history = updatedHistory, currentIndex = List.length updatedHistory }
+                , Cmd.batch [ send_ToBackend (Wire.bytesEncode (Types.w3_encode_ToBackend toBackend)) ]
+                )
 
         FEtoBEDelayed toBackend ->
             let
@@ -510,12 +623,33 @@ update msg m =
 
                                 ( newBem, newBeCmds ) =
                                     userBackendApp.updateFromFrontend s c toBackend m.bem
+
+                                newHistoryEntry =
+                                    { kind = KindToBackend
+                                    , msg = Debug.toString toBackend
+                                    , fem = m.fem
+                                    , bem = Just newBem
+                                    , source = Just { sessionId = s, clientId = c }
+                                    , target = Nothing
+                                    , timestamp = 0
+                                    }
+
+                                updatedHistory =
+                                    if m.currentIndex < List.length m.history then
+                                        -- If we're in the middle of history, truncate it
+                                        List.take m.currentIndex m.history ++ [ newHistoryEntry ]
+                                    else
+                                        m.history ++ [ newHistoryEntry ]
                             in
-                            ( { m | bem = newBem, bemDirty = True }
-                            , Cmd.batch
-                                [ Cmd.map BEMsg newBeCmds
-                                ]
-                            )
+                            withDebugger <|
+                                ( { m 
+                                    | bem = newBem
+                                    , bemDirty = True
+                                    , history = updatedHistory
+                                    , currentIndex = List.length updatedHistory
+                                  }
+                                , Cmd.map BEMsg newBeCmds
+                                )
 
                         Nothing ->
                             let
@@ -533,10 +667,32 @@ update msg m =
 
                         ( newFem, newFeCmds ) =
                             userFrontendApp.updateFromBackend toFrontend m.fem
+
+                        newHistoryEntry =
+                            { kind = KindToFrontend
+                            , msg = Debug.toString toFrontend
+                            , fem = newFem
+                            , bem = if m.nodeType == Leader then Just m.bem else Nothing
+                            , source = Nothing
+                            , target = Just { sessionId = args.s, clientId = args.c }
+                            , timestamp = 0
+                            }
+
+                        updatedHistory =
+                            if m.currentIndex < List.length m.history then
+                                -- If we're in the middle of history, truncate it
+                                List.take m.currentIndex m.history ++ [ newHistoryEntry ]
+                            else
+                                m.history ++ [ newHistoryEntry ]
                     in
-                    ( { m | fem = storeFE m newFem }
-                    , Cmd.map FEMsg newFeCmds
-                    )
+                    withDebugger <|
+                        ( { m 
+                            | fem = storeFE m newFem
+                            , history = updatedHistory
+                            , currentIndex = List.length updatedHistory
+                          }
+                        , Cmd.map FEMsg newFeCmds
+                        )
 
                 Nothing ->
                     let
@@ -552,9 +708,10 @@ update msg m =
                         x =
                             log "❇️ ReceivedBackendModel" newBem
                     in
-                    ( { m | bem = newBem }
-                    , Cmd.none
-                    )
+                    withDebugger <|
+                        ( { m | bem = newBem }
+                        , Cmd.none
+                        )
 
                 Nothing ->
                     let
@@ -626,43 +783,46 @@ update msg m =
                 ( newBem, newBeCmds ) =
                     userBackendApp.init
             in
-            ( { m
-                | fem = LD.debugS "fe" newFem
-                , bem = newBem
-                , bemDirty = True
-              }
-            , Cmd.batch
-                [ trigger (PersistBackend True)
-                ]
-            )
+            withDebugger <|
+                ( { m
+                    | fem = LD.debugS "fe" newFem
+                    , bem = newBem
+                    , bemDirty = True
+                  }
+                , Cmd.batch
+                    [ trigger (PersistBackend True)
+                    ]
+                )
 
         ResetDebugStoreFE ->
             let
                 ( newFem, newFeCmds ) =
                     userFrontendApp.init m.originalUrl m.originalKey
             in
-            ( { m
-                | fem = LD.debugS "fe" newFem
-              }
-            , Cmd.batch
-                [ Cmd.map FEMsg newFeCmds
-                ]
-            )
+            withDebugger <|
+                ( { m
+                    | fem = LD.debugS "fe" newFem
+                  }
+                , Cmd.batch
+                    [ Cmd.map FEMsg newFeCmds
+                    ]
+                )
 
         ResetDebugStoreBE ->
             let
                 ( newBem, newBeCmds ) =
                     userBackendApp.init
             in
-            ( { m
-                | bem = newBem
-                , bemDirty = True
-              }
-            , Cmd.batch
-                [ Cmd.map BEMsg newBeCmds
-                , trigger (PersistBackend True)
-                ]
-            )
+            withDebugger <|
+                ( { m
+                    | bem = newBem
+                    , bemDirty = True
+                  }
+                , Cmd.batch
+                    [ Cmd.map BEMsg newBeCmds
+                    , trigger (PersistBackend True)
+                    ]
+                )
 
         ToggledFreezeMode ->
             let
@@ -679,9 +839,10 @@ update msg m =
                     else
                         m.fem
             in
-            ( { m | devbar = LD.debugS "d" newDevbar, fem = newFem }
-            , Cmd.none
-            )
+            withDebugger <|
+                ( { m | devbar = LD.debugS "d" newDevbar, fem = newFem }
+                , Cmd.none
+                )
 
         ToggledNetworkDelay ->
             let
@@ -691,9 +852,10 @@ update msg m =
                 newDevbar =
                     { devbar | networkDelay = not m.devbar.networkDelay }
             in
-            ( { m | devbar = LD.debugS "d" newDevbar }
-            , Cmd.none
-            )
+            withDebugger <|
+                ( { m | devbar = LD.debugS "d" newDevbar }
+                , Cmd.none
+                )
 
         ToggledLogging ->
             let
@@ -703,9 +865,10 @@ update msg m =
                 newDevbar =
                     { devbar | logging = not m.devbar.logging }
             in
-            ( { m | devbar = LD.debugS "d" newDevbar }
-            , Cmd.none
-            )
+            withDebugger <|
+                ( { m | devbar = LD.debugS "d" newDevbar }
+                , Cmd.none
+                )
 
         QRCodeShow ->
             let
@@ -715,9 +878,10 @@ update msg m =
                 newDevbar =
                     { devbar | qrCodeShow = True }
             in
-            ( { m | devbar = newDevbar }
-            , Cmd.none
-            )
+            withDebugger <|
+                ( { m | devbar = newDevbar }
+                , Cmd.none
+                )
 
         QRCodeHide ->
             let
@@ -727,9 +891,10 @@ update msg m =
                 newDevbar =
                     { devbar | qrCodeShow = False }
             in
-            ( { m | devbar = newDevbar }
-            , Cmd.none
-            )
+            withDebugger <|
+                ( { m | devbar = newDevbar }
+                , Cmd.none
+                )
 
         ClickedLocation ->
             let
@@ -739,9 +904,10 @@ update msg m =
                 newDevbar =
                     { devbar | location = next m.devbar.location }
             in
-            ( { m | devbar = LD.debugS "d" newDevbar }
-            , Cmd.none
-            )
+            withDebugger <|
+                ( { m | devbar = LD.debugS "d" newDevbar }
+                , Cmd.none
+                )
 
         PersistBackend reload ->
             let
@@ -754,19 +920,21 @@ update msg m =
                             save_BackendModel { t = "p", f = reload, b = Wire.bytesEncode (Types.w3_encode_BackendModel bem) }
             in
             if m.bemDirty then
-                ( { m | bemDirty = False }
-                , Cmd.batch
-                    [ persistBeState m.nodeType m.bem
-                    , if reload then
-                        delay 200 Reload
+                withDebugger <|
+                    ( { m | bemDirty = False }
+                    , Cmd.batch
+                        [ persistBeState m.nodeType m.bem
+                        , if reload then
+                            delay 200 Reload
 
-                      else
-                        Cmd.none
-                    ]
-                )
+                          else
+                            Cmd.none
+                        ]
+                    )
 
             else
-                ( m, Cmd.none )
+                withDebugger <|
+                    ( m, Cmd.none )
 
         Reload ->
             ( m, LD.browserReload )
@@ -969,18 +1137,82 @@ update msg m =
         Noop ->
             ( m, Cmd.none )
 
+        ToggleTimeTravel ->
+            if m.debuggerWindowOpen then
+                ( { m | debuggerWindowOpen = False }
+                , closeDebuggerWindow ()
+                )
+            else
+                ( { m | debuggerWindowOpen = True }
+                , Cmd.batch
+                    [ openDebuggerWindow { width = 800, height = 600 }
+                    , updateDebugger 
+                        { history = List.map historyToJson m.history
+                        , currentIndex = m.currentIndex
+                        }
+                    ]
+                )
+
+        JumpTo index ->
+            if index >= 0 && index < List.length m.history then
+                case List.drop index m.history |> List.head of
+                    Just entry ->
+                        ( { m
+                            | fem = entry.fem
+                            , bem = Maybe.withDefault m.bem entry.bem
+                            , currentIndex = index
+                          }
+                        , Cmd.none
+                        )
+
+                    Nothing ->
+                        ( m, Cmd.none )
+            else
+                ( m, Cmd.none )
+
+        ReceivedFrontendMsg args ->
+            case m.nodeType of
+                Follower ->
+                    -- Only Leader records frontend messages
+                    ( m, Cmd.none )
+
+                Leader ->
+                    let
+                        newHistoryEntry =
+                            { kind = KindFrontend
+                            , msg = args.msg
+                            , fem = m.fem  -- Keep Leader's frontend model
+                            , bem = Just m.bem
+                            , source = Just { sessionId = args.s, clientId = args.c }
+                            , target = Nothing
+                            , timestamp = 0
+                            }
+
+                        updatedHistory =
+                            if m.currentIndex < List.length m.history then
+                                -- If we're in the middle of history, truncate it
+                                List.take m.currentIndex m.history ++ [ newHistoryEntry ]
+                            else
+                                m.history ++ [ newHistoryEntry ]
+                    in
+                    withDebugger <|
+                        ( { m 
+                            | history = updatedHistory
+                            , currentIndex = List.length updatedHistory
+                          }
+                        , Cmd.none
+                        )
+
 
 subscriptions { nodeType, fem, bem, bemDirty } =
     Sub.batch
         [ Sub.map FEMsg (userFrontendApp.subscriptions fem)
         , if nodeType == Leader then
             Sub.map BEMsg (userBackendApp.subscriptions bem)
-
           else
             Sub.none
         , if nodeType == Leader && bemDirty then
             LD.every 1000 (always (PersistBackend False))
-
           else
             Sub.none
         , setNodeTypeLeader SetNodeTypeLeader
@@ -993,6 +1225,7 @@ subscriptions { nodeType, fem, bem, bemDirty } =
         , onConnection OnConnection
         , onDisconnection OnDisconnection
         , LD.every (10 * 60 * 1000) VersionCheck
+        , debuggerWindowClosed (always (ToggleTimeTravel))
         ]
 
 
@@ -1029,13 +1262,18 @@ yForLocation location =
 lamderaUI :
     DevBar
     -> NodeType
+    -> Model
     -> List (Html Msg)
-lamderaUI devbar nodeType =
+lamderaUI devbar nodeType model =
     case devbar.liveStatus of
         Online ->
             [ Html.Lazy.lazy2 lamderaPane devbar nodeType
             , Html.Lazy.lazy envModeChanger devbar.showModeChanger
             , Html.Lazy.lazy resetNotification devbar.showResetNotification
+            , if model.timeTravelOpen then
+                renderTimeTravelUi model
+              else
+                text ""
             ]
 
         Offline ->
@@ -1445,12 +1683,15 @@ expandedUI topDown devbar nodeType =
             div [] [ versionInfo, envDocs ]
         , case nodeType of
             Leader ->
-                case devbar.freeze of
+                div []
+                    [ case devbar.freeze of
                     False ->
                         buttonDev "Reset Backend" ResetDebugStoreBE
 
                     True ->
                         buttonDev "Reset Both" ResetDebugStoreBoth
+                    , buttonDev "Time Travel" ToggleTimeTravel
+                    ]
 
             Follower ->
                 div [ style "padding" "8px 8px", style "text-align" "center" ] [ text "Use leader tab (green dot) for reset options" ]
@@ -1465,6 +1706,7 @@ expandedUI topDown devbar nodeType =
 
             True ->
                 buttonDevColoredIcon "Freeze Mode" "On" blue iconFreeze ToggledFreezeMode
+
         , case devbar.networkDelay of
             True ->
                 buttonDevColoredIcon "Network Delay" "500ms" yellow iconNetwork ToggledNetworkDelay
@@ -1473,38 +1715,15 @@ expandedUI topDown devbar nodeType =
                 buttonDevOff "Network Delay: Off" iconNetwork ToggledNetworkDelay
         , case devbar.logging of
             True ->
-                -- buttonDev "Logging: On"
                 buttonDevColoredIcon "Logging" "On" white iconLogs ToggledLogging
 
             False ->
                 buttonDevOff "Logging: Off" iconLogs ToggledLogging
-
-        -- , if devbar.qrCodeShow == True then
-        --     div [ style "text-align" "center" ]
-        --         [ img
-        --             [ src "https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=http://192.168.0.2:8000"
-        --             , style "width" "150"
-        --             , style "height" "150"
-        --             ]
-        --             []
-        --         ]
-        --
-        --   else
-        --     text ""
-        -- , div
-        --     [ onMouseEnter QRCodeShow
-        --     , onMouseLeave QRCodeHide
-        --     , style "cursor" "pointer"
-        --     , style "text-align" "center"
-        --     ]
-        --     [ text "QR Code" ]
         , if topDown then
             div [] [ envDocs, versionInfo ]
 
           else
             text ""
-
-        -- , lamderaSnapshots devbar
         ]
 
 
@@ -1614,6 +1833,7 @@ mapDocument model msg { title, body } =
             ++ lamderaUI
                 model.devbar
                 model.nodeType
+                model
     }
 
 
@@ -1928,5 +2148,369 @@ justs =
 --             Err (Http.BadStatus statusCode)
 --         Http.NetworkError_ ->
 --             Err Http.NetworkError
---         Http.GoodStatus_ _ bytes ->
---             Ok bytes
+--         Http.GoodStatus_ metadata text ->
+--             Ok text
+
+
+renderTimeTravelUi : Model -> Html Msg
+renderTimeTravelUi model =
+    let
+        indexedHistory =
+            List.indexedMap (\i entry -> ( i, entry )) model.history
+
+        kindColor kind =
+            case kind of
+                KindFrontend ->
+                    green
+
+                KindBackend ->
+                    blue
+
+                KindToFrontend ->
+                    yellow
+
+                KindToBackend ->
+                    red
+
+        frontendInfo entry =
+            case ( entry.source, entry.target ) of
+                ( Just source, Nothing ) ->
+                    " (from " ++ source.clientId ++ ")"
+
+                ( Nothing, Just target ) ->
+                    " (to " ++ target.clientId ++ ")"
+
+                ( Just source, Just target ) ->
+                    " (from " ++ source.clientId ++ " to " ++ target.clientId ++ ")"
+
+                ( Nothing, Nothing ) ->
+                    ""
+
+        historyEntry ( i, entry ) =
+            div
+                [ style "padding" "4px 8px"
+                , style "margin" "2px 0"
+                , style "cursor" "pointer"
+                , style "background-color" (if i == model.currentIndex then "#444" else "#333")
+                , style "border-left" ("3px solid " ++ kindColor entry.kind)
+                , onClick (JumpTo i)
+                ]
+                [ div [ style "font-size" "12px" ]
+                    [ text (String.fromInt i ++ ": " ++ entry.msg ++ frontendInfo entry) ]
+                ]
+
+        currentEntry =
+            List.drop model.currentIndex model.history
+                |> List.head
+                |> Maybe.withDefault 
+                    { kind = KindFrontend
+                    , msg = "Initial State"
+                    , fem = model.fem
+                    , bem = Just model.bem
+                    , source = Nothing
+                    , target = Nothing
+                    , timestamp = 0
+                    }
+
+        -- Function to pretty print JSON-like data
+        prettyPrint str =
+            str
+                |> String.lines
+                |> List.map String.trim
+                |> String.join "\n"
+                |> (\s -> 
+                    if String.startsWith "{" s then
+                        "{\n  " ++ (String.dropLeft 1 (String.dropRight 1 s) |> String.replace "," ",\n  ") ++ "\n}"
+                    else
+                        s
+                   )
+
+        -- Models panel on the right
+        modelsPanel =
+            let
+                -- Get the models after the selected message
+                currentModels =
+                    if model.currentIndex == -1 then
+                        -- Initial state
+                        { kind = KindFrontend
+                        , msg = "Initial State"
+                        , fem = model.fem  -- Use the initial frontend model
+                        , bem = Just model.bem
+                        , source = Nothing
+                        , target = Nothing
+                        , timestamp = 0
+                        }
+                    else
+                        -- Get the entry at current index to show post-message state
+                        List.drop model.currentIndex model.history
+                            |> List.head
+                            |> Maybe.withDefault 
+                                { kind = KindFrontend
+                                , msg = "Initial State"
+                                , fem = model.fem
+                                , bem = Just model.bem
+                                , source = Nothing
+                                , target = Nothing
+                                , timestamp = 0
+                                }
+
+                -- Collect all unique frontend models from history up to current index
+                frontendModels =
+                    -- Start with the current frontend model
+                    [ ( model.clientId, currentModels.fem ) ]
+                        -- Then add models from history
+                        |> List.append
+                            (List.take (model.currentIndex + 1) model.history
+                                |> List.filterMap (\entry -> 
+                                    case entry.source of
+                                        Just source -> Just ( source.clientId, entry.fem )
+                                        Nothing -> Nothing
+                                )
+                                |> List.reverse
+                            )
+                        -- Keep only the latest model for each clientId
+                        |> List.foldl 
+                            (\(clientId, fem) acc ->
+                                if List.any (\(existingId, _) -> existingId == clientId) acc then
+                                    acc
+                                else
+                                    (clientId, fem) :: acc
+                            )
+                            []
+            in
+            div [ style "width" "50%", style "padding-left" "1rem" ]
+                [ h4 [ style "margin" "0 0 0.5rem 0" ] [ text "Backend Model" ]
+                , pre 
+                    [ style "margin" "0 0 1rem 0"
+                    , style "background-color" "#333"
+                    , style "padding" "0.5rem"
+                    , style "border-radius" "4px"
+                    ] 
+                    [ text (prettyPrint (Debug.toString (Maybe.withDefault model.bem currentModels.bem))) ]
+                , h4 [ style "margin" "0 0 0.5rem 0" ] [ text "Frontend Models" ]
+                , div []
+                    (List.map
+                        (\(clientId, fem) ->
+                            div [ style "margin-bottom" "1rem" ]
+                                [ div [ style "font-size" "0.8em", style "color" "#999", style "margin-bottom" "0.25rem" ]
+                                    [ text ("Client: " ++ clientId ++ if clientId == model.clientId then " (current)" else "") ]
+                                , pre 
+                                    [ style "margin" "0"
+                                    , style "background-color" "#333"
+                                    , style "padding" "0.5rem"
+                                    , style "border-radius" "4px"
+                                    ] 
+                                    [ text (prettyPrint (Debug.toString fem)) ]
+                                ]
+                        )
+                        frontendModels
+                    )
+                ]
+
+        -- Add initial state entry at the top of history
+        historyWithInitial =
+            ( -1
+            , { kind = KindFrontend
+              , msg = "Initial State"
+              , fem = model.fem
+              , bem = Just model.bem
+              , source = Nothing
+              , target = Nothing
+              , timestamp = 0
+              }
+            ) :: indexedHistory
+    in
+    div
+        [ style "position" "absolute"  -- Changed from fixed
+        , style "top" "0"
+        , style "left" "0"
+        , style "right" "0"
+        , style "bottom" "0"
+        , style "background-color" charcoal
+        , style "color" white
+        , style "padding" "1rem"
+        , style "overflow" "hidden"
+        ]
+        [ div 
+            [ style "display" "flex"
+            , style "justify-content" "space-between"
+            , style "align-items" "center"
+            , style "padding-bottom" "0.5rem"
+            , style "margin-bottom" "0.5rem"
+            , style "border-bottom" "1px solid #444"
+            ]
+            [ h3 [ style "margin" "0" ] [ text "Time Travel Debugger" ]
+            , button
+                [ onClick ToggleTimeTravel
+                , style "background" "none"
+                , style "border" "none"
+                , style "color" white
+                , style "cursor" "pointer"
+                , style "font-size" "20px"
+                , style "padding" "4px 8px"
+                , style "border-radius" "4px"
+                ]
+                [ text "×" ]
+            ]
+        , div 
+            [ style "display" "flex"
+            , style "overflow" "hidden"
+            , style "height" "calc(100% - 3rem)"
+            ] 
+            [ div 
+                [ style "width" "50%"
+                , style "overflow" "hidden"
+                , style "display" "flex"
+                , style "flex-direction" "column"
+                ] 
+                [ div 
+                    [ style "margin-bottom" "8px"
+                    , style "padding" "4px 8px"
+                    , style "background-color" "#333"
+                    , style "border-radius" "4px"
+                    ]
+                    [ text ("Current index: " ++ String.fromInt model.currentIndex)
+                    , text (" / " ++ String.fromInt (List.length model.history - 1))
+                    ]
+                , div 
+                    [ style "flex" "1"
+                    , style "overflow-y" "auto"
+                    , style "overflow-x" "hidden"
+                    , style "min-height" "0"
+                    ] 
+                    (List.map historyEntry historyWithInitial)
+                ]
+            , div 
+                [ style "width" "50%"
+                , style "padding-left" "1rem"
+                , style "overflow" "hidden"
+                , style "display" "flex"
+                , style "flex-direction" "column"
+                ] 
+                [ h4 [ style "margin" "0 0 0.5rem 0" ] [ text "Backend Model" ]
+                , pre 
+                    [ style "margin" "0 0 1rem 0"
+                    , style "background-color" "#333"
+                    , style "padding" "0.5rem"
+                    , style "border-radius" "4px"
+                    , style "overflow-x" "auto"
+                    ] 
+                    [ text (prettyPrint (Debug.toString (Maybe.withDefault model.bem currentEntry.bem))) ]
+                , h4 [ style "margin" "0 0 0.5rem 0" ] [ text "Frontend Models" ]
+                , div 
+                    [ style "flex" "1"
+                    , style "overflow-y" "auto"
+                    , style "overflow-x" "hidden"
+                    , style "min-height" "0"
+                    ]
+                    (List.map
+                        (\(clientId, fem) ->
+                            div [ style "margin-bottom" "1rem" ]
+                                [ div [ style "font-size" "0.8em", style "color" "#999", style "margin-bottom" "0.25rem" ]
+                                    [ text ("Client: " ++ clientId ++ if clientId == model.clientId then " (current)" else "") ]
+                                , pre 
+                                    [ style "margin" "0"
+                                    , style "background-color" "#333"
+                                    , style "padding" "0.5rem"
+                                    , style "border-radius" "4px"
+                                    , style "overflow-x" "auto"
+                                    ] 
+                                    [ text (prettyPrint (Debug.toString fem)) ]
+                                ]
+                        )
+                        ([ ( model.clientId, currentEntry.fem ) ]
+                            |> List.append
+                                (List.take (model.currentIndex + 1) model.history
+                                    |> List.filterMap (\entry -> 
+                                        case entry.source of
+                                            Just source -> Just ( source.clientId, entry.fem )
+                                            Nothing -> Nothing
+                                    )
+                                    |> List.reverse
+                                )
+                            |> List.foldl 
+                                (\(clientId, fem) acc ->
+                                    if List.any (\(existingId, _) -> existingId == clientId) acc then
+                                        acc
+                                    else
+                                        (clientId, fem) :: acc
+                                )
+                                []
+                        )
+                    )
+                ]
+            ]
+        ]
+
+-- Add near the other ports
+port openDebuggerWindow : { width : Int, height : Int } -> Cmd msg
+port closeDebuggerWindow : () -> Cmd msg
+port debuggerWindowClosed : (() -> msg) -> Sub msg
+port updateDebugger : { history : List { kind : String, msg : String, source : Maybe { sessionId : String, clientId : String }, target : Maybe { sessionId : String, clientId : String }, timestamp : Int }, currentIndex : Int } -> Cmd msg
+
+-- Helper function to convert HistoryEntry to JSON-compatible format
+historyToJson : HistoryEntry -> { kind : String, msg : String, source : Maybe { sessionId : String, clientId : String }, target : Maybe { sessionId : String, clientId : String }, timestamp : Int }
+historyToJson entry =
+    { kind = case entry.kind of
+        KindFrontend -> "frontend"
+        KindBackend -> "backend"
+        KindToFrontend -> "toFrontend"
+        KindToBackend -> "toBackend"
+    , msg = entry.msg
+    , source = entry.source
+    , target = entry.target
+    , timestamp = entry.timestamp
+    }
+
+-- Helper function to send updates to debugger window
+sendToDebugger : Model -> Cmd msg
+sendToDebugger model =
+    if model.debuggerWindowOpen then
+        updateDebugger 
+            { history = List.map historyToJson model.history
+            , currentIndex = model.currentIndex
+            }
+    else
+        Cmd.none
+
+-- Update the view function to send content to debugger window
+view : Model -> Browser.Document Msg
+view model =
+    let
+        { title, body } =
+            userFrontendApp.view model.fem
+    in
+    { title = title
+    , body =
+        List.map (Html.map FEMsg) body
+        ++ [ devBar model ]
+    }
+
+devBar : Model -> Html Msg
+devBar model =
+    div
+        [ style "position" "fixed"
+        , style "bottom" "0"
+        , style "right" "0"
+        , style "z-index" "1000"
+        ]
+        [ div
+            [ style "background-color" "#1e1e1e"
+            , style "color" "white"
+            , style "padding" "8px"
+            , style "border-radius" "4px"
+            , style "margin" "8px"
+            ]
+            [ text (nodeTypeToString model.nodeType)
+            , text " | "
+            , button
+                [ onClick ToggleTimeTravel
+                , style "background" "none"
+                , style "border" "none"
+                , style "color" "white"
+                , style "cursor" "pointer"
+                , style "padding" "4px 8px"
+                ]
+                [ text "Time Travel" ]
+            ]
+        ]

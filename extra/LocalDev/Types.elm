@@ -1,4 +1,11 @@
-module Types exposing (..)
+module Types exposing
+    ( BackendModel
+    , BackendMsg(..)
+    , FrontendModel
+    , FrontendMsg(..)
+    , ToBackend(..)
+    , ToFrontend(..)
+    )
 
 import Browser exposing (UrlRequest)
 import Browser.Navigation exposing (Key)
@@ -25,6 +32,7 @@ type FrontendMsg
 
 type ToBackend
     = NoOpToBackend
+    | NotifyLeaderFrontendMsg FrontendMsg  -- Used by Followers to notify Leader about their frontend messages
 
 
 type BackendMsg

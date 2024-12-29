@@ -37,3 +37,8 @@ updateFromFrontend sessionId clientId msg model =
     case msg of
         NoOpToBackend ->
             ( model, Cmd.none )
+
+        NotifyLeaderFrontendMsg frontendMsg ->
+            -- When a Follower sends us their frontend message, we'll record it in our history
+            -- This will be handled by the Leader's update function
+            ( model, Cmd.none )
