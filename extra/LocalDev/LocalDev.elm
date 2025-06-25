@@ -32,7 +32,9 @@ import Lamdera.Json as Json
 import Lamdera.Wire3 as Wire exposing (Bytes)
 import Process
 import Task exposing (Task)
-import Types exposing (BackendModel, BackendMsg, FrontendModel, FrontendMsg, ToBackend, ToFrontend)
+import Types exposing (BackendModel, BackendMsg(..), FrontendModel, FrontendMsg, ToBackend(..), ToFrontend)
+import Json.Decode as D
+import Json.Encode as E
 
 -- ADD A NEW TYPE FOR OUR HISTORY
 type alias FrontendId =
@@ -55,6 +57,15 @@ type MsgKind
     | KindBackend
     | KindToFrontend
     | KindToBackend
+
+
+msgKindToString : MsgKind -> String
+msgKindToString kind =
+    case kind of
+        KindFrontend -> "Frontend"
+        KindBackend -> "Backend"
+        KindToFrontend -> "ToFrontend"
+        KindToBackend -> "ToBackend"
 
 type Location
     = TopLeft
@@ -101,7 +112,12 @@ type alias Model =
     , history : List HistoryEntry
     , currentIndex : Int
     , timeTravelOpen : Bool
-    , debuggerWindowOpen : Bool  -- Add this field
+    , debuggerWindowOpen : Bool
+    , timeTravelPosition : { x : Float, y : Float }  -- Add this
+    , timeTravelSize : { width : Float, height : Float }  -- Add this
+    , isDragging : Bool  -- Add this
+    , isResizing : Bool  -- Add this
+    , dragStart : Maybe { x : Float, y : Float }  -- Add this
     }
 
 type alias DevBar =
@@ -183,6 +199,12 @@ port onConnection : (ConnectionMsg -> msg) -> Sub msg
 port onDisconnection : (ConnectionMsg -> msg) -> Sub msg
 
 
+port openDebugWindow : E.Value -> Cmd msg
+
+
+port debuggerMessage : (E.Value -> msg) -> Sub msg
+
+
 type alias ConnectionMsg =
     { s : SessionId, c : ClientId }
 
@@ -235,6 +257,14 @@ type Msg
     | LoadedSnapshotLegacy (Result LD.HttpError ( List Int, Int ))
     | Noop
     | JumpTo Int
+    | OpenDebugPage
+    | TimeTravelDragStart Float Float  -- Add these new messages
+    | TimeTravelDragMove Float Float
+    | TimeTravelDragEnd
+    | TimeTravelResizeStart Float Float
+    | TimeTravelResizeMove Float Float
+    | TimeTravelResizeEnd
+    | DebuggerMessage E.Value
 
 
 type alias Flags =
@@ -373,6 +403,11 @@ init flags url key =
       , currentIndex = 0
       , timeTravelOpen = False
       , debuggerWindowOpen = False  -- Initialize as closed
+      , timeTravelPosition = { x = 0, y = 0 }  -- Add this
+      , timeTravelSize = { width = 0, height = 0 }  -- Add this
+      , isDragging = False  -- Add this
+      , isResizing = False  -- Add this
+      , dragStart = Nothing  -- Add this
       }
     , Cmd.batch
         [ Cmd.map FEMsg newFeCmds
@@ -583,9 +618,26 @@ update msg m =
                 let
                     _ =
                         log "F▶️  " toBackend
+
+                    -- If this is a follower sending a frontend message to the leader, record it
+                    cmd = 
+                    -- case toBackend of
+                        -- NotifyLeaderFrontendMsg frontendMsg ->
+                            -- Send the frontend message to the leader for recording
+                            Cmd.batch 
+                                [ send_ToBackend (Wire.bytesEncode (Types.w3_encode_ToBackend toBackend))
+                                -- , rpcOut <| E.object
+                                --     [ ("t", E.string "q")
+                                --     , ("s", E.string m.sessionId)
+                                --     , ("c", E.string m.clientId)
+                                --     , ("msg", E.string (Debug.toString ((Wire.bytesEncode (Types.w3_encode_ToBackend toBackend)))))
+                                --     ]
+                                ]
+                        -- _ ->
+                        --     Cmd.batch [ send_ToBackend (Wire.bytesEncode (Types.w3_encode_ToBackend toBackend)) ]
                 in
                 ( { m | history = updatedHistory, currentIndex = List.length updatedHistory }
-                , Cmd.batch [ send_ToBackend (Wire.bytesEncode (Types.w3_encode_ToBackend toBackend)) ]
+                , cmd
                 )
 
         FEtoBEDelayed toBackend ->
@@ -1137,20 +1189,51 @@ update msg m =
         Noop ->
             ( m, Cmd.none )
 
+        OpenDebugPage ->
+            let
+                entryToJson entry =
+                    E.object
+                        [ ( "kind", E.string (msgKindToString entry.kind) )
+                        , ( "msg", E.string entry.msg )
+                        ]
+                
+                debugState = 
+                    E.object
+                        [ ( "history", E.list entryToJson m.history )
+                        , ( "currentIndex", E.int m.currentIndex )
+                        , ( "fem", E.string (Debug.toString m.fem) )
+                        , ( "bem", E.string (Debug.toString m.bem) )
+                        ]
+            in
+            ( m, openDebugWindow debugState )
+
         ToggleTimeTravel ->
-            if m.debuggerWindowOpen then
-                ( { m | debuggerWindowOpen = False }
-                , closeDebuggerWindow ()
-                )
+            if m.timeTravelOpen then
+                ( { m | timeTravelOpen = False }, Cmd.none )
             else
-                ( { m | debuggerWindowOpen = True }
-                , Cmd.batch
-                    [ openDebuggerWindow { width = 800, height = 600 }
-                    , updateDebugger 
-                        { history = List.map historyToJson m.history
-                        , currentIndex = m.currentIndex
-                        }
-                    ]
+                let
+                    -- Set initial size if not already set
+                    initialSize = 
+                        if m.timeTravelSize.width == 0 then
+                            { width = 800, height = 600 }
+                        else
+                            m.timeTravelSize
+                            
+                    -- Center the window if it's the first time opening
+                    initialPosition =
+                        if m.timeTravelPosition.x == 0 && m.timeTravelPosition.y == 0 then
+                            { x = 100  -- Add some margin from the left
+                            , y = 50   -- Add some margin from the top
+                            }
+                        else
+                            m.timeTravelPosition
+                in
+                ( { m 
+                    | timeTravelOpen = True
+                    , timeTravelSize = initialSize
+                    , timeTravelPosition = initialPosition
+                  }
+                , Cmd.none
                 )
 
         JumpTo index ->
@@ -1203,6 +1286,68 @@ update msg m =
                         , Cmd.none
                         )
 
+        TimeTravelDragStart x y ->
+            let
+                dragStartOffset =
+                    { x = x - m.timeTravelPosition.x
+                    , y = y - m.timeTravelPosition.y
+                    }
+            in
+            ( { m | isDragging = True, dragStart = Just dragStartOffset }, Cmd.none )
+
+        TimeTravelDragMove x y ->
+            case m.dragStart of
+                Just offset ->
+                    let
+                        newPosition =
+                            { x = x - offset.x
+                            , y = y - offset.y
+                            }
+                    in
+                    ( { m | timeTravelPosition = newPosition }, Cmd.none )
+                Nothing ->
+                    ( m, Cmd.none )
+
+        TimeTravelDragEnd ->
+            ( { m | isDragging = False, dragStart = Nothing }, Cmd.none )
+
+        TimeTravelResizeStart x y ->
+            ( { m | isResizing = True, dragStart = Just { x = x, y = y } }, Cmd.none )
+
+        TimeTravelResizeMove x y ->
+            case m.dragStart of
+                Just start ->
+                    let
+                        dx = x - start.x
+                        dy = y - start.y
+                        newSize = 
+                            { width = Basics.max 400 (m.timeTravelSize.width + dx)
+                            , height = Basics.max 300 (m.timeTravelSize.height + dy)
+                            }
+                    in
+                    ( { m 
+                        | timeTravelSize = newSize
+                        , dragStart = Just { x = x, y = y }
+                      }
+                    , Cmd.none
+                    )
+                Nothing ->
+                    ( m, Cmd.none )
+
+        TimeTravelResizeEnd ->
+            ( { m | isResizing = False, dragStart = Nothing }, Cmd.none )
+        
+        DebuggerMessage value ->
+            case D.decodeValue (D.field "type" D.string) value of
+                Ok "jumpTo" ->
+                    case D.decodeValue (D.field "index" D.int) value of
+                        Ok index ->
+                            update (JumpTo index) m
+                        Err _ ->
+                            ( m, Cmd.none )
+                _ ->
+                    ( m, Cmd.none )
+
 
 subscriptions { nodeType, fem, bem, bemDirty } =
     Sub.batch
@@ -1225,7 +1370,7 @@ subscriptions { nodeType, fem, bem, bemDirty } =
         , onConnection OnConnection
         , onDisconnection OnDisconnection
         , LD.every (10 * 60 * 1000) VersionCheck
-        , debuggerWindowClosed (always (ToggleTimeTravel))
+        , debuggerMessage DebuggerMessage
         ]
 
 
@@ -1267,13 +1412,9 @@ lamderaUI :
 lamderaUI devbar nodeType model =
     case devbar.liveStatus of
         Online ->
-            [ Html.Lazy.lazy2 lamderaPane devbar nodeType
+            [ Html.Lazy.lazy3 lamderaPane devbar nodeType model
             , Html.Lazy.lazy envModeChanger devbar.showModeChanger
             , Html.Lazy.lazy resetNotification devbar.showResetNotification
-            , if model.timeTravelOpen then
-                renderTimeTravelUi model
-              else
-                text ""
             ]
 
         Offline ->
@@ -1391,7 +1532,7 @@ resetNotification showReset =
         text ""
 
 
-lamderaPane devbar nodeType =
+lamderaPane devbar nodeType model =
     div
         [ style "font-family" "system-ui, Helvetica Neue, sans-serif"
         , style "font-size" "12px"
@@ -1407,16 +1548,16 @@ lamderaPane devbar nodeType =
         ]
         (case devbar.location of
             TopLeft ->
-                lamderaDevBar True devbar nodeType
+                lamderaDevBar True devbar nodeType model
 
             TopRight ->
-                lamderaDevBar True devbar nodeType
+                lamderaDevBar True devbar nodeType model
 
             BottomRight ->
-                lamderaDevBar False devbar nodeType
+                lamderaDevBar False devbar nodeType model
 
             BottomLeft ->
-                lamderaDevBar False devbar nodeType
+                lamderaDevBar False devbar nodeType model
         )
 
 
@@ -1472,7 +1613,7 @@ envMeta =
             ( "Dev", green )
 
 
-lamderaDevBar topDown devbar nodeType =
+lamderaDevBar topDown devbar nodeType model =
     case topDown of
         True ->
             [ pill devbar nodeType
@@ -1480,7 +1621,7 @@ lamderaDevBar topDown devbar nodeType =
                 div
                     [ style "border-top" "1px solid #393939"
                     ]
-                    [ expandedUI topDown devbar nodeType
+                    [ expandedUI topDown devbar nodeType model
                     ]
 
               else
@@ -1493,7 +1634,7 @@ lamderaDevBar topDown devbar nodeType =
                     [ style "border-bottom" "1px solid #393939"
                     , style "padding-bottom" "5px"
                     ]
-                    [ expandedUI topDown devbar nodeType ]
+                    [ expandedUI topDown devbar nodeType model ]
 
               else
                 text ""
@@ -1621,7 +1762,7 @@ spacer width =
     span [ style "width" (String.fromInt width ++ "px"), style "display" "inline-block" ] []
 
 
-expandedUI topDown devbar nodeType =
+expandedUI topDown devbar nodeType model =
     let
         modeText =
             case devbar.freeze of
@@ -1690,7 +1831,7 @@ expandedUI topDown devbar nodeType =
 
                     True ->
                         buttonDev "Reset Both" ResetDebugStoreBoth
-                    , buttonDev "Time Travel" ToggleTimeTravel
+                    , buttonDev ("Time Travel (" ++ String.fromInt (List.length model.history) ++ ")") OpenDebugPage
                     ]
 
             Follower ->
@@ -2225,88 +2366,6 @@ renderTimeTravelUi model =
                         s
                    )
 
-        -- Models panel on the right
-        modelsPanel =
-            let
-                -- Get the models after the selected message
-                currentModels =
-                    if model.currentIndex == -1 then
-                        -- Initial state
-                        { kind = KindFrontend
-                        , msg = "Initial State"
-                        , fem = model.fem  -- Use the initial frontend model
-                        , bem = Just model.bem
-                        , source = Nothing
-                        , target = Nothing
-                        , timestamp = 0
-                        }
-                    else
-                        -- Get the entry at current index to show post-message state
-                        List.drop model.currentIndex model.history
-                            |> List.head
-                            |> Maybe.withDefault 
-                                { kind = KindFrontend
-                                , msg = "Initial State"
-                                , fem = model.fem
-                                , bem = Just model.bem
-                                , source = Nothing
-                                , target = Nothing
-                                , timestamp = 0
-                                }
-
-                -- Collect all unique frontend models from history up to current index
-                frontendModels =
-                    -- Start with the current frontend model
-                    [ ( model.clientId, currentModels.fem ) ]
-                        -- Then add models from history
-                        |> List.append
-                            (List.take (model.currentIndex + 1) model.history
-                                |> List.filterMap (\entry -> 
-                                    case entry.source of
-                                        Just source -> Just ( source.clientId, entry.fem )
-                                        Nothing -> Nothing
-                                )
-                                |> List.reverse
-                            )
-                        -- Keep only the latest model for each clientId
-                        |> List.foldl 
-                            (\(clientId, fem) acc ->
-                                if List.any (\(existingId, _) -> existingId == clientId) acc then
-                                    acc
-                                else
-                                    (clientId, fem) :: acc
-                            )
-                            []
-            in
-            div [ style "width" "50%", style "padding-left" "1rem" ]
-                [ h4 [ style "margin" "0 0 0.5rem 0" ] [ text "Backend Model" ]
-                , pre 
-                    [ style "margin" "0 0 1rem 0"
-                    , style "background-color" "#333"
-                    , style "padding" "0.5rem"
-                    , style "border-radius" "4px"
-                    ] 
-                    [ text (prettyPrint (Debug.toString (Maybe.withDefault model.bem currentModels.bem))) ]
-                , h4 [ style "margin" "0 0 0.5rem 0" ] [ text "Frontend Models" ]
-                , div []
-                    (List.map
-                        (\(clientId, fem) ->
-                            div [ style "margin-bottom" "1rem" ]
-                                [ div [ style "font-size" "0.8em", style "color" "#999", style "margin-bottom" "0.25rem" ]
-                                    [ text ("Client: " ++ clientId ++ if clientId == model.clientId then " (current)" else "") ]
-                                , pre 
-                                    [ style "margin" "0"
-                                    , style "background-color" "#333"
-                                    , style "padding" "0.5rem"
-                                    , style "border-radius" "4px"
-                                    ] 
-                                    [ text (prettyPrint (Debug.toString fem)) ]
-                                ]
-                        )
-                        frontendModels
-                    )
-                ]
-
         -- Add initial state entry at the top of history
         historyWithInitial =
             ( -1
@@ -2319,126 +2378,193 @@ renderTimeTravelUi model =
               , timestamp = 0
               }
             ) :: indexedHistory
+
+        -- Add new helper functions for dragging and resizing
+        onMouseDown : (Float -> Float -> msg) -> Html.Attribute msg
+        onMouseDown msg =
+            Html.Events.on "mousedown" 
+                (D.map2 msg
+                    (D.field "clientX" D.float)
+                    (D.field "clientY" D.float)
+                )
+
+        -- Default size if not set
+        size =
+            if model.timeTravelSize.width == 0 then
+                { width = 800, height = 600 }
+            else
+                model.timeTravelSize
+
+        -- Default position if not set
+        position =
+            if model.timeTravelPosition.x == 0 && model.timeTravelPosition.y == 0 then
+                { x = (toFloat (round ((toFloat windowWidth) / 2)) - (size.width / 2))
+                , y = (toFloat (round ((toFloat windowHeight) / 2)) - (size.height / 2))
+                }
+            else
+                model.timeTravelPosition
+
+        windowWidth = 1920  -- You might want to make this dynamic
+        windowHeight = 1080  -- You might want to make this dynamic
     in
     div
-        [ style "position" "absolute"  -- Changed from fixed
+        [ style "position" "fixed"
         , style "top" "0"
         , style "left" "0"
         , style "right" "0"
         , style "bottom" "0"
-        , style "background-color" charcoal
-        , style "color" white
-        , style "padding" "1rem"
-        , style "overflow" "hidden"
+        , style "z-index" "2147483647"
+        , style "background-color" "rgba(0, 0, 0, 0.5)"
+        , if model.isDragging || model.isResizing then
+            Html.Events.on "mousemove" 
+                (D.map2 
+                    (if model.isDragging then TimeTravelDragMove else TimeTravelResizeMove)
+                    (D.field "clientX" D.float)
+                    (D.field "clientY" D.float)
+                )
+          else
+            style "" ""
+        , if model.isDragging || model.isResizing then
+            Html.Events.on "mouseup" (D.succeed (if model.isDragging then TimeTravelDragEnd else TimeTravelResizeEnd))
+          else
+            style "" ""
         ]
         [ div 
-            [ style "display" "flex"
-            , style "justify-content" "space-between"
-            , style "align-items" "center"
-            , style "padding-bottom" "0.5rem"
-            , style "margin-bottom" "0.5rem"
-            , style "border-bottom" "1px solid #444"
-            ]
-            [ h3 [ style "margin" "0" ] [ text "Time Travel Debugger" ]
-            , button
-                [ onClick ToggleTimeTravel
-                , style "background" "none"
-                , style "border" "none"
-                , style "color" white
-                , style "cursor" "pointer"
-                , style "font-size" "20px"
-                , style "padding" "4px 8px"
-                , style "border-radius" "4px"
-                ]
-                [ text "×" ]
-            ]
-        , div 
-            [ style "display" "flex"
+            [ style "position" "absolute"
+            , style "left" (String.fromFloat position.x ++ "px")
+            , style "top" (String.fromFloat position.y ++ "px")
+            , style "width" (String.fromFloat size.width ++ "px")
+            , style "height" (String.fromFloat size.height ++ "px")
+            , style "background-color" charcoal
+            , style "color" white
+            , style "border-radius" "6px"
+            , style "box-shadow" "0 4px 12px rgba(0, 0, 0, 0.5)"
             , style "overflow" "hidden"
-            , style "height" "calc(100% - 3rem)"
-            ] 
+            ]
             [ div 
-                [ style "width" "50%"
-                , style "overflow" "hidden"
-                , style "display" "flex"
-                , style "flex-direction" "column"
-                ] 
-                [ div 
-                    [ style "margin-bottom" "8px"
-                    , style "padding" "4px 8px"
-                    , style "background-color" "#333"
-                    , style "border-radius" "4px"
+                [ style "display" "flex"
+                , style "justify-content" "space-between"
+                , style "align-items" "center"
+                , style "padding" "0.25rem"
+                , style "margin-bottom" "0.25rem"
+                , style "border-bottom" "1px solid #444"
+                , style "cursor" "move"
+                , onMouseDown TimeTravelDragStart
+                ]
+                [ h3 [ style "margin" "0", style "font-size" "16px" ] [ text "Time Travel Debugger" ]
+                , button
+                    [ onClick ToggleTimeTravel
+                    , style "background" "none"
+                    , style "border" "none"
+                    , style "color" white
+                    , style "cursor" "pointer"
+                    , style "font-size" "18px"
+                    , style "padding" "2px 6px"
                     ]
-                    [ text ("Current index: " ++ String.fromInt model.currentIndex)
-                    , text (" / " ++ String.fromInt (List.length model.history - 1))
-                    ]
-                , div 
-                    [ style "flex" "1"
-                    , style "overflow-y" "auto"
-                    , style "overflow-x" "hidden"
-                    , style "min-height" "0"
-                    ] 
-                    (List.map historyEntry historyWithInitial)
+                    [ text "×" ]
                 ]
             , div 
-                [ style "width" "50%"
-                , style "padding-left" "1rem"
+                [ style "display" "flex"
                 , style "overflow" "hidden"
-                , style "display" "flex"
-                , style "flex-direction" "column"
+                , style "height" "calc(100% - 2rem)"
                 ] 
-                [ h4 [ style "margin" "0 0 0.5rem 0" ] [ text "Backend Model" ]
-                , pre 
-                    [ style "margin" "0 0 1rem 0"
-                    , style "background-color" "#333"
-                    , style "padding" "0.5rem"
-                    , style "border-radius" "4px"
-                    , style "overflow-x" "auto"
+                [ div 
+                    [ style "width" "50%"
+                    , style "overflow" "hidden"
+                    , style "display" "flex"
+                    , style "flex-direction" "column"
                     ] 
-                    [ text (prettyPrint (Debug.toString (Maybe.withDefault model.bem currentEntry.bem))) ]
-                , h4 [ style "margin" "0 0 0.5rem 0" ] [ text "Frontend Models" ]
-                , div 
-                    [ style "flex" "1"
-                    , style "overflow-y" "auto"
-                    , style "overflow-x" "hidden"
-                    , style "min-height" "0"
+                    [ div 
+                        [ style "margin-bottom" "6px"
+                        , style "padding" "3px 6px"
+                        , style "background-color" "#333"
+                        , style "border-radius" "4px"
+                        , style "font-size" "11px"
+                        ]
+                        [ text ("Current index: " ++ String.fromInt model.currentIndex)
+                        , text (" / " ++ String.fromInt (List.length model.history - 1))
+                        ]
+                    , div 
+                        [ style "flex" "1"
+                        , style "overflow-y" "auto"
+                        , style "overflow-x" "hidden"
+                        , style "min-height" "0"
+                        ] 
+                        (List.map historyEntry historyWithInitial)
                     ]
-                    (List.map
-                        (\(clientId, fem) ->
-                            div [ style "margin-bottom" "1rem" ]
-                                [ div [ style "font-size" "0.8em", style "color" "#999", style "margin-bottom" "0.25rem" ]
-                                    [ text ("Client: " ++ clientId ++ if clientId == model.clientId then " (current)" else "") ]
-                                , pre 
-                                    [ style "margin" "0"
-                                    , style "background-color" "#333"
-                                    , style "padding" "0.5rem"
-                                    , style "border-radius" "4px"
-                                    , style "overflow-x" "auto"
-                                    ] 
-                                    [ text (prettyPrint (Debug.toString fem)) ]
-                                ]
-                        )
-                        ([ ( model.clientId, currentEntry.fem ) ]
-                            |> List.append
-                                (List.take (model.currentIndex + 1) model.history
-                                    |> List.filterMap (\entry -> 
-                                        case entry.source of
-                                            Just source -> Just ( source.clientId, entry.fem )
-                                            Nothing -> Nothing
+                , div 
+                    [ style "width" "50%"
+                    , style "padding-left" "1rem"
+                    , style "overflow" "hidden"
+                    , style "display" "flex"
+                    , style "flex-direction" "column"
+                    ] 
+                    [ h4 [ style "margin" "0 0 0.25rem 0", style "font-size" "14px" ] [ text "Backend Model" ]
+                    , pre 
+                        [ style "margin" "0 0 0.75rem 0"
+                        , style "background-color" "#333"
+                        , style "padding" "0.4rem"
+                        , style "border-radius" "4px"
+                        , style "overflow-x" "auto"
+                        , style "font-size" "11px"
+                        ] 
+                        [ text (prettyPrint (Debug.toString (Maybe.withDefault model.bem currentEntry.bem))) ]
+                    , h4 [ style "margin" "0 0 0.25rem 0", style "font-size" "14px" ] [ text "Frontend Models" ]
+                    , div 
+                        [ style "flex" "1"
+                        , style "overflow-y" "auto"
+                        , style "overflow-x" "hidden"
+                        , style "min-height" "0"
+                        ]
+                        (List.map
+                            (\(clientId, fem) ->
+                                div [ style "margin-bottom" "1rem" ]
+                                    [ div [ style "font-size" "0.7em", style "color" "#999", style "margin-bottom" "0.2rem" ]
+                                        [ text ("Client: " ++ clientId ++ if clientId == model.clientId then " (current)" else "") ]
+                                    , pre 
+                                        [ style "margin" "0"
+                                        , style "background-color" "#333"
+                                        , style "padding" "0.4rem"
+                                        , style "border-radius" "4px"
+                                        , style "overflow-x" "auto"
+                                        , style "font-size" "11px"
+                                        ] 
+                                        [ text (prettyPrint (Debug.toString fem)) ]
+                                    ]
+                            )
+                            ([ ( model.clientId, currentEntry.fem ) ]
+                                |> List.append
+                                    (List.take (model.currentIndex + 1) model.history
+                                        |> List.filterMap (\entry -> 
+                                            case entry.source of
+                                                Just source -> Just ( source.clientId, entry.fem )
+                                                Nothing -> Nothing
+                                        )
+                                        |> List.reverse
                                     )
-                                    |> List.reverse
-                                )
-                            |> List.foldl 
-                                (\(clientId, fem) acc ->
-                                    if List.any (\(existingId, _) -> existingId == clientId) acc then
-                                        acc
-                                    else
-                                        (clientId, fem) :: acc
-                                )
-                                []
+                                |> List.foldl 
+                                    (\(clientId, fem) acc ->
+                                        if List.any (\(existingId, _) -> existingId == clientId) acc then
+                                            acc
+                                        else
+                                            (clientId, fem) :: acc
+                                    )
+                                    []
+                            )
                         )
-                    )
+                    ]
                 ]
+            , div
+                [ style "position" "absolute"
+                , style "right" "0"
+                , style "bottom" "0"
+                , style "width" "20px"
+                , style "height" "20px"
+                , style "cursor" "se-resize"
+                , style "background" "linear-gradient(135deg, transparent 50%, #666 50%)"
+                , onMouseDown TimeTravelResizeStart
+                ]
+                []
             ]
         ]
 
@@ -2483,7 +2609,7 @@ view model =
     { title = title
     , body =
         List.map (Html.map FEMsg) body
-        ++ [ devBar model ]
+        ++ lamderaUI model.devbar model.nodeType model
     }
 
 devBar : Model -> Html Msg
@@ -2504,13 +2630,13 @@ devBar model =
             [ text (nodeTypeToString model.nodeType)
             , text " | "
             , button
-                [ onClick ToggleTimeTravel
+                [ onClick OpenDebugPage
                 , style "background" "none"
                 , style "border" "none"
                 , style "color" "white"
                 , style "cursor" "pointer"
                 , style "padding" "4px 8px"
                 ]
-                [ text "Time Travel" ]
+                [ text ("Time Travel (" ++ String.fromInt (List.length model.history) ++ ")") ]
             ]
         ]

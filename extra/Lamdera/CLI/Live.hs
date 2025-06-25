@@ -124,12 +124,16 @@ directoryConfig =
 -- non-extensioned paths to the "index" (in this case the src/LocalDev.elm
 -- harness as we're local in the reactor). Extensioned paths will continue to
 -- the next handler, namely `error404` (see `run` fn at top of file)
+-- Removed serveDebugPage since we use window.open approach instead
+
 serveUnmatchedUrlsToIndex :: FilePath -> (FilePath -> Snap()) -> Snap ()
 serveUnmatchedUrlsToIndex root serveElm =
   do  file <- getSafePath
       guard (takeExtension file == "")
       serveElm (lamderaCache root </> "LocalDev.elm")
 
+
+-- Removed prepareLocalDevDebug since we use window.open approach instead
 
 prepareLocalDev :: FilePath -> IO FilePath
 prepareLocalDev root = do
@@ -786,4 +790,4 @@ passOnIndex pwd =
       pure ()
 
 
-x = 1735483258
+x = 1735578445

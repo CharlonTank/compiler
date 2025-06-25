@@ -149,6 +149,162 @@ window.setupApp = function(name, elid) {
       msgEmitter({ t:"ToBackend", s: sessionId, c: clientId, b: b64 })
     })
 
+    if (app.ports.openDebugWindow) {
+      app.ports.openDebugWindow.subscribe(function (debugState) {
+        console.log('openDebugWindow called with:', debugState);
+        
+        try {
+          // Try to open the window
+          const debugWindow = window.open('', 'LamderaDebugger', 'width=800,height=600,scrollbars=yes,resizable=yes');
+          
+          if (!debugWindow) {
+            alert('Popup blocked! Please allow popups for this site and try again.');
+            return;
+          }
+          
+          // Create a standalone HTML page for the debugger
+          const debuggerHTML = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Lamdera Time Travel Debugger</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background-color: #1a1a1a;
+            color: white;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        h1 { margin-top: 0; color: #4CAF50; }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .history-list {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 16px 0;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .history-item {
+            padding: 8px;
+            margin: 4px 0;
+            background: #333;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .history-item:hover {
+            background: #444;
+        }
+        .history-item.active {
+            background: #0066cc;
+        }
+        .model-view {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 16px 0;
+        }
+        pre {
+            margin: 0;
+            white-space: pre-wrap;
+            font-size: 12px;
+        }
+        .test-info {
+            background: #333;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🐛 Lamdera Time Travel Debugger</h1>
+        <div class="test-info">
+            Debug window opened successfully! History count: <span id="historyCount">0</span>
+        </div>
+        <div id="content">Loading...</div>
+    </div>
+    <script>
+        const debugState = ${JSON.stringify(debugState)};
+        console.log('Debug state:', debugState);
+        
+        function render() {
+            document.getElementById('historyCount').textContent = debugState.history.length;
+            const content = document.getElementById('content');
+            content.innerHTML = \`
+                <div class="history-list">
+                    <h3>Message History (\${debugState.history.length} messages)</h3>
+                    \${debugState.history.map((item, index) => \`
+                        <div class="history-item \${index === debugState.currentIndex ? 'active' : ''}" 
+                             onclick="jumpTo(\${index})">
+                            [\${index}] \${item.kind}: \${item.msg.substring(0, 100)}...
+                        </div>
+                    \`).join('')}
+                </div>
+                <div class="model-view">
+                    <h3>Frontend Model</h3>
+                    <pre>\${debugState.fem}</pre>
+                </div>
+                <div class="model-view">
+                    <h3>Backend Model</h3>
+                    <pre>\${debugState.bem}</pre>
+                </div>
+            \`;
+        }
+        
+        function jumpTo(index) {
+            console.log('Jumping to index:', index);
+            // Send message back to parent window
+            if (window.opener) {
+                window.opener.postMessage({
+                    type: 'jumpTo',
+                    index: index
+                }, '*');
+            }
+        }
+        
+        // Listen for updates from parent window
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'updateDebugState') {
+                Object.assign(debugState, event.data.state);
+                render();
+            }
+        });
+        
+        render();
+    </script>
+</body>
+</html>`;
+          
+          debugWindow.document.write(debuggerHTML);
+          debugWindow.document.close();
+          
+          // Store reference to debug window for updates
+          window.lamderaDebugWindow = debugWindow;
+          
+          console.log('Debug window created successfully');
+        } catch (error) {
+          console.error('Error opening debug window:', error);
+          alert('Error opening debug window: ' + error.message);
+        }
+      })
+    }
+
+    // Listen for messages from debug window
+    window.addEventListener('message', (event) => {
+      if (event.data.type === 'jumpTo' && app.ports.debuggerMessage) {
+        app.ports.debuggerMessage.send({
+          type: 'jumpTo',
+          index: event.data.index
+        });
+      }
+    });
+
     // Auto-generated by extra/Lamdera/Injection.hs
     if (typeof elmPkgJsIncludes !== "undefined") elmPkgJsIncludes.init(app)
 
