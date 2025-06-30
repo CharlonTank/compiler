@@ -213,6 +213,62 @@ window.setupApp = function(name, elid) {
             white-space: pre-wrap;
             font-size: 12px;
         }
+        .timeline-container {
+            background: #1e1e1e;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 16px 0;
+            height: 400px;
+            overflow: auto;
+            position: relative;
+        }
+        .timeline-header {
+            color: #ccc;
+            font-size: 12px;
+            margin-bottom: 16px;
+        }
+        .timeline-svg {
+            border: 1px solid #333;
+            background: #0a0a0a;
+        }
+        .lane-label {
+            font-size: 11px;
+            fill: #ccc;
+            font-family: monospace;
+        }
+        .lane-line {
+            stroke: #333;
+            stroke-width: 1;
+        }
+        .message-dot {
+            cursor: pointer;
+            stroke: #000;
+            stroke-width: 1;
+        }
+        .message-dot:hover {
+            stroke: #fff;
+            stroke-width: 2;
+        }
+        .message-dot.selected {
+            stroke: #4CAF50;
+            stroke-width: 3;
+        }
+        .connection-line {
+            stroke: #666;
+            stroke-width: 1;
+            fill: none;
+            opacity: 0.7;
+        }
+        .connection-line.selected {
+            stroke: #4CAF50;
+            stroke-width: 2;
+            opacity: 1;
+        }
+        .kind-init { fill: #9966CC; }
+        .kind-frontend { fill: #85BC7A; }
+        .kind-backend { fill: #4196AD; }
+        .kind-tofrontend { fill: #FFCB64; }
+        .kind-tobackend { fill: #E06C75; }
         .test-info {
             background: #333;
             padding: 10px;
@@ -225,7 +281,8 @@ window.setupApp = function(name, elid) {
     <div class="container">
         <h1>🐛 Lamdera Time Travel Debugger</h1>
         <div class="test-info">
-            Debug window opened successfully! History count: <span id="historyCount">0</span>
+            Debug window opened successfully! History count: <span id="historyCount">0</span><br>
+            <small>Use ↑/↓ or j/k keys to navigate, Home/End to jump to start/end</small>
         </div>
         <div id="content">Loading...</div>
     </div>
@@ -233,10 +290,108 @@ window.setupApp = function(name, elid) {
         const debugState = ${JSON.stringify(debugState)};
         console.log('Debug state:', debugState);
         
+        function generateTimeline() {
+            // Extract unique client IDs from the debug state
+            const clientIds = new Set();
+            
+            // Add clients from current frontend models
+            if (debugState.frontendModels) {
+                debugState.frontendModels.forEach(([clientId]) => clientIds.add(clientId));
+            }
+            
+            // Add clients from history entries
+            debugState.history.forEach(entry => {
+                if (entry.frontendModels) {
+                    entry.frontendModels.forEach(([clientId]) => clientIds.add(clientId));
+                }
+                if (entry.source) clientIds.add(entry.source.clientId);
+                if (entry.target) clientIds.add(entry.target.clientId);
+            });
+            
+            const clients = Array.from(clientIds).sort();
+            const lanes = ['Backend', ...clients];
+            
+            const laneHeight = 50;
+            const laneWidth = Math.max(800, debugState.history.length * 15 + 200);
+            const svgHeight = lanes.length * laneHeight + 40;
+            const messageSpacing = (laneWidth - 200) / Math.max(1, debugState.history.length);
+            
+            function getLaneY(laneId) {
+                if (laneId === 'Backend') return laneHeight / 2;
+                const clientIndex = clients.indexOf(laneId);
+                return (clientIndex + 1) * laneHeight + laneHeight / 2;
+            }
+            
+            function getMessageX(index) {
+                return 150 + index * messageSpacing;
+            }
+            
+            let svg = \`<svg class="timeline-svg" width="\${laneWidth}" height="\${svgHeight}">\`;
+            
+            // Draw lane lines and labels
+            lanes.forEach((lane, i) => {
+                const y = (i + 0.5) * laneHeight;
+                svg += \`<line class="lane-line" x1="140" y1="\${y}" x2="\${laneWidth - 20}" y2="\${y}"></line>\`;
+                svg += \`<text class="lane-label" x="10" y="\${y + 4}">\${lane}</text>\`;
+            });
+            
+            // Draw messages and connections
+            debugState.history.forEach((entry, index) => {
+                const messageX = getMessageX(index);
+                const isSelected = index === debugState.currentIndex;
+                const kindClass = 'kind-' + entry.kind.toLowerCase().replace(/([a-z])([A-Z])/g, '$1$2').toLowerCase();
+                
+                // Determine which lane this message belongs to
+                let messageY;
+                if (entry.kind === 'Backend' || entry.kind === 'ToBackend') {
+                    messageY = getLaneY('Backend');
+                } else if (entry.source && entry.source.clientId) {
+                    messageY = getLaneY(entry.source.clientId);
+                } else if (entry.target && entry.target.clientId) {
+                    messageY = getLaneY(entry.target.clientId);
+                } else {
+                    // Default to first client lane for Frontend messages
+                    messageY = clients.length > 0 ? getLaneY(clients[0]) : getLaneY('Backend');
+                }
+                
+                // Draw connection lines for ToFrontend and ToBackend messages
+                if (entry.kind === 'ToFrontend' && entry.target) {
+                    const sourceY = getLaneY('Backend');
+                    const targetY = getLaneY(entry.target.clientId);
+                    svg += \`<path class="connection-line \${isSelected ? 'selected' : ''}" 
+                             d="M \${messageX} \${sourceY} Q \${messageX + 20} \${(sourceY + targetY) / 2} \${messageX} \${targetY}"></path>\`;
+                }
+                
+                if (entry.kind === 'ToBackend' && entry.source) {
+                    const sourceY = getLaneY(entry.source.clientId);
+                    const targetY = getLaneY('Backend');
+                    svg += \`<path class="connection-line \${isSelected ? 'selected' : ''}" 
+                             d="M \${messageX} \${sourceY} Q \${messageX + 20} \${(sourceY + targetY) / 2} \${messageX} \${targetY}"></path>\`;
+                }
+                
+                // Draw the message dot
+                const radius = isSelected ? 8 : 5;
+                svg += \`<circle class="message-dot \${kindClass} \${isSelected ? 'selected' : ''}" 
+                         cx="\${messageX}" cy="\${messageY}" r="\${radius}"
+                         onclick="jumpTo(\${index})"
+                         title="[\${index}] \${entry.kind}: \${entry.msg.substring(0, 50)}...">
+                         </circle>\`;
+            });
+            
+            svg += \`</svg>\`;
+            return svg;
+        }
+        
         function render() {
             document.getElementById('historyCount').textContent = debugState.history.length;
             const content = document.getElementById('content');
             content.innerHTML = \`
+                <div class="timeline-container">
+                    <div class="timeline-header">
+                        Timeline Visualization (${debugState.history.length} messages)
+                    </div>
+                    \${generateTimeline()}
+                </div>
                 <div class="history-list">
                     <h3>Message History (\${debugState.history.length} messages)</h3>
                     \${debugState.history.map((item, index) => \`
@@ -247,8 +402,16 @@ window.setupApp = function(name, elid) {
                     \`).join('')}
                 </div>
                 <div class="model-view">
-                    <h3>Frontend Model</h3>
-                    <pre>\${debugState.fem}</pre>
+                    <h3>Frontend Models</h3>
+                    \${debugState.frontendModels && debugState.frontendModels.length > 0 ? 
+                        debugState.frontendModels.map(([clientId, frontendModel]) => \`
+                            <div class="client-model">
+                                <h4 style="color: #4CAF50; margin: 8px 0 4px 0; font-size: 12px;">Client: \${clientId}</h4>
+                                <pre style="margin: 0; background: #444; padding: 8px; border-radius: 4px; font-size: 11px;">\${frontendModel}</pre>
+                            </div>
+                        \`).join('')
+                        : '<div style="color: #999; font-style: italic;">No frontend models available</div>'
+                    }
                 </div>
                 <div class="model-view">
                     <h3>Backend Model</h3>
@@ -259,6 +422,10 @@ window.setupApp = function(name, elid) {
         
         function jumpTo(index) {
             console.log('Jumping to index:', index);
+            // Update local state immediately for responsiveness
+            debugState.currentIndex = index;
+            render();
+            
             // Send message back to parent window
             if (window.opener) {
                 window.opener.postMessage({
@@ -268,6 +435,41 @@ window.setupApp = function(name, elid) {
             }
         }
         
+        function moveUp() {
+            const newIndex = Math.max(-1, debugState.currentIndex - 1);
+            jumpTo(newIndex);
+        }
+        
+        function moveDown() {
+            const maxIndex = debugState.history.length - 1;
+            const newIndex = Math.min(maxIndex, debugState.currentIndex + 1);
+            jumpTo(newIndex);
+        }
+        
+        // Keyboard navigation
+        document.addEventListener('keydown', (event) => {
+            switch(event.key) {
+                case 'ArrowUp':
+                case 'k': // Vim-style navigation
+                    event.preventDefault();
+                    moveUp();
+                    break;
+                case 'ArrowDown':
+                case 'j': // Vim-style navigation
+                    event.preventDefault();
+                    moveDown();
+                    break;
+                case 'Home':
+                    event.preventDefault();
+                    jumpTo(-1); // Go to initial state
+                    break;
+                case 'End':
+                    event.preventDefault();
+                    jumpTo(debugState.history.length - 1); // Go to latest
+                    break;
+            }
+        });
+        
         // Listen for updates from parent window
         window.addEventListener('message', (event) => {
             if (event.data.type === 'updateDebugState') {
@@ -275,6 +477,9 @@ window.setupApp = function(name, elid) {
                 render();
             }
         });
+        
+        // Auto-focus the window for keyboard events
+        window.focus();
         
         render();
     </script>
@@ -295,6 +500,18 @@ window.setupApp = function(name, elid) {
       })
     }
 
+    // Handler for updating debugger state
+    if (app.ports.updateDebuggerState) {
+      app.ports.updateDebuggerState.subscribe(function (debugState) {
+        if (window.lamderaDebugWindow && !window.lamderaDebugWindow.closed) {
+          window.lamderaDebugWindow.postMessage({
+            type: 'updateDebugState',
+            state: debugState
+          }, '*');
+        }
+      });
+    }
+
     // Listen for messages from debug window
     window.addEventListener('message', (event) => {
       if (event.data.type === 'jumpTo' && app.ports.debuggerMessage) {
@@ -304,6 +521,68 @@ window.setupApp = function(name, elid) {
         });
       }
     });
+
+    // Handler for sending frontend model updates
+    if (app.ports.sendFrontendModelUpdate) {
+      app.ports.sendFrontendModelUpdate.subscribe(function (payload) {
+        // Send this as a WebSocket message to the leader
+        // Ensure fem is base64 encoded
+        payload.fem = bytesToBase64(payload.fem);
+        msgEmitter(payload);
+      });
+    }
+
+    // Handler for sending frontend messages
+    if (app.ports.sendFrontendMessage) {
+      console.log("[live.js] sendFrontendMessage port found, subscribing");
+      app.ports.sendFrontendMessage.subscribe(function (payload) {
+        console.log("[live.js] Sending frontend message to leader:", payload);
+        // Send this as a WebSocket message to the leader
+        msgEmitter(payload);
+      });
+    } else {
+      console.log("[live.js] WARNING: sendFrontendMessage port not found!");
+    }
+
+    // Handler for broadcasting time travel state
+    if (app.ports.broadcastTimeTravelState) {
+      app.ports.broadcastTimeTravelState.subscribe(function (payload) {
+        // Broadcast time travel state to all clients
+        msgEmitter(payload);
+      });
+    }
+
+    // Handler for enabling/disabling client interaction
+    if (app.ports.setClientInteractionEnabled) {
+      app.ports.setClientInteractionEnabled.subscribe(function (enabled) {
+        const overlay = document.getElementById('lamdera-time-travel-overlay');
+        if (!enabled) {
+          // Create overlay to block interaction
+          if (!overlay) {
+            const div = document.createElement('div');
+            div.id = 'lamdera-time-travel-overlay';
+            div.style.cssText = `
+              position: fixed;
+              top: 0;
+              left: 0;
+              width: 100%;
+              height: 100%;
+              z-index: 999999;
+              background: rgba(0, 0, 0, 0.1);
+              cursor: not-allowed;
+              pointer-events: all;
+            `;
+            div.title = 'Time travel mode - interaction disabled. Navigate to latest history to enable.';
+            document.body.appendChild(div);
+          }
+        } else {
+          // Remove overlay to enable interaction
+          if (overlay) {
+            overlay.remove();
+          }
+        }
+      });
+    }
 
     // Auto-generated by extra/Lamdera/Injection.hs
     if (typeof elmPkgJsIncludes !== "undefined") elmPkgJsIncludes.init(app)
@@ -438,6 +717,43 @@ window.setupApp = function(name, elid) {
 
       case "d":
         msgInbound("onDisconnection", { s: d.s, c: d.c })
+        break;
+
+      case "fmu":
+        // Frontend Model Update - forward to leader's Elm app
+        if (app !== null && app.ports.receiveFrontendModelUpdate) {
+          app.ports.receiveFrontendModelUpdate.send({
+            s: d.s,
+            c: d.c,
+            fem: base64ToBytes(d.fem)
+          });
+        }
+        break;
+
+      case "fm":
+        // Frontend Message - forward to leader's Elm app  
+        console.log("[live.js] Received frontend message from follower:", d);
+        if (app !== null && app.ports.receiveFrontendMessage) {
+          console.log("[live.js] Forwarding to Elm app");
+          app.ports.receiveFrontendMessage.send({
+            s: d.s,
+            c: d.c,
+            msg: d.msg
+          });
+        } else {
+          console.log("[live.js] WARNING: app or receiveFrontendMessage port not available");
+        }
+        break;
+
+      case "tts":
+        // Time Travel State - broadcast from leader to all followers
+        if (app !== null && app.ports.receiveTimeTravelState) {
+          app.ports.receiveTimeTravelState.send({
+            index: d.index,
+            frontendModels: d.frontendModels,
+            bem: d.bem
+          });
+        }
         break;
 
       case "x":

@@ -54,8 +54,7 @@ type alias HistoryEntry =
     }
 
 type MsgKind
-    = KindInit
-    | KindFrontend
+    = KindFrontend
     | KindBackend
     | KindToFrontend
     | KindToBackend
@@ -64,7 +63,6 @@ type MsgKind
 msgKindToString : MsgKind -> String
 msgKindToString kind =
     case kind of
-        KindInit -> "Init"
         KindFrontend -> "Frontend"
         KindBackend -> "Backend"
         KindToFrontend -> "ToFrontend"
@@ -209,36 +207,6 @@ port openDebugWindow : E.Value -> Cmd msg
 port debuggerMessage : (E.Value -> msg) -> Sub msg
 
 
--- Multi-client time travel ports
-port sendFrontendModelUpdate : { t : String, s : String, c : String, fem : Bytes } -> Cmd msg
-
-
-port receiveFrontendModelUpdate : ({ s : String, c : String, fem : Bytes } -> msg) -> Sub msg
-
-
-port sendFrontendMessage : { t : String, s : String, c : String, msg : String } -> Cmd msg
-
-
-port receiveFrontendMessage : ({ s : String, c : String, msg : String } -> msg) -> Sub msg
-
-
-port broadcastTimeTravelState : { t : String, index : Int, frontendModels : List (List String), bem : String } -> Cmd msg
-
-
-port receiveTimeTravelState : ({ index : Int, frontendModels : List (List String), bem : String } -> msg) -> Sub msg
-
-
-port setClientInteractionEnabled : Bool -> Cmd msg
-
-
--- Helper function for debugging (simplified for now)
-sendToDebugger : Model -> Cmd Msg
-sendToDebugger model =
-    -- For now, just return Cmd.none
-    -- In the future, this could send debug info to external debugger
-    Cmd.none
-
-
 type alias ConnectionMsg =
     { s : SessionId, c : ClientId }
 
@@ -257,7 +225,6 @@ type Msg
     | ReceivedToFrontend { t : String, b : Bytes, s : String, c : String }
     | ReceivedBackendModel Bytes
     | ReceivedFrontendMsg { s : String, c : String, msg : String }  -- New variant
-    | ReceivedFrontendModelUpdate { s : String, c : String, fem : Bytes }  -- For multi-client tracking
     | RPCIn Json.Value
     | SetNodeTypeLeader Bool
     | SetLiveStatus Bool
@@ -300,7 +267,6 @@ type Msg
     | TimeTravelResizeMove Float Float
     | TimeTravelResizeEnd
     | DebuggerMessage E.Value
-    | ReceivedTimeTravelState { index : Int, frontendModels : List (List String), bem : String }
 
 
 type alias Flags =
@@ -435,16 +401,7 @@ init flags url key =
       , sessionId = flags.s
       , clientId = flags.c
       , devbar = devbar
-      , history = 
-          [ { kind = KindInit  -- New kind for initial state
-            , msg = "Initial State"
-            , frontendModels = [(flags.c, fem)]  -- Initial frontend model
-            , bem = Just bem
-            , source = Nothing
-            , target = Nothing
-            , timestamp = 0
-            }
-          ]
+      , history = []
       , currentIndex = 0
       , timeTravelOpen = False
       , debuggerWindowOpen = False  -- Initialize as closed
@@ -518,14 +475,8 @@ update msg m =
                     userFrontendApp.update frontendMsg m.fem
 
                 -- Update the activeFrontendModels with the new frontend model
-                -- Ensure the clientId in the model matches our actual clientId
                 updatedActiveFrontendModels =
-                    let
-                        -- If the frontend model has a clientId field, we need to ensure it matches
-                        -- This is a workaround - ideally the app would handle this
-                        correctedFem = newFem
-                    in
-                    Dict.insert m.clientId correctedFem m.activeFrontendModels
+                    Dict.insert m.clientId newFem m.activeFrontendModels
 
                 -- Record in the history (only Leader keeps full history)
                 newHistoryEntry =
@@ -545,42 +496,13 @@ update msg m =
                     else
                         m.history ++ [ newHistoryEntry ]
             in
-            let
-                updatedModel = 
-                    { m 
-                    | fem = storeFE m newFem
-                    , activeFrontendModels = updatedActiveFrontendModels
-                    , history = if m.nodeType == Leader then updatedHistory else m.history  -- Only leader updates history
-                    , currentIndex = if m.nodeType == Leader then List.length updatedHistory else m.currentIndex
-                    }
-            in
-            ( updatedModel
-            , Cmd.batch
-                [ Cmd.map FEMsg newFeCmds
-                -- If we're a follower, send both our frontend model AND message to the leader
-                , if m.nodeType == Follower then
-                    Cmd.batch
-                        [ sendFrontendModelUpdate
-                            { t = "fmu"  -- Frontend Model Update
-                            , s = m.sessionId
-                            , c = m.clientId
-                            , fem = Wire.bytesEncode (Types.w3_encode_FrontendModel newFem)
-                            }
-                        , sendFrontendMessage
-                            { t = "fm"  -- Frontend Message
-                            , s = m.sessionId
-                            , c = m.clientId
-                            , msg = Debug.toString frontendMsg
-                            }
-                        ]
-                  else
-                    Cmd.none
-                -- Update debugger if open and we're the leader
-                , if m.nodeType == Leader then
-                    sendToDebugger updatedModel
-                  else
-                    Cmd.none
-                ]
+            ( { m 
+                | fem = storeFE m newFem
+                , activeFrontendModels = updatedActiveFrontendModels
+                , history = updatedHistory
+                , currentIndex = List.length updatedHistory
+              }
+            , Cmd.map FEMsg newFeCmds
             )
 
         BEMsg backendMsg ->
@@ -621,10 +543,7 @@ update msg m =
                             , history = updatedHistory
                             , currentIndex = List.length updatedHistory
                           }
-                        , Cmd.batch
-                            [ Cmd.map BEMsg newBeCmds
-                            , sendToDebugger { m | bem = newBem, bemDirty = True, history = updatedHistory, currentIndex = List.length updatedHistory }
-                            ]
+                        , Cmd.map BEMsg newBeCmds
                         )
 
         BEtoFE clientId toFrontend ->
@@ -656,24 +575,14 @@ update msg m =
                                 m.history ++ [ newHistoryEntry ]
                     in
                     if m.devbar.networkDelay then
-                        let
-                            updatedModel = { m | history = updatedHistory, currentIndex = List.length updatedHistory }
-                        in
-                        ( updatedModel
-                        , Cmd.batch
-                            [ delay 500 (BEtoFEDelayed clientId toFrontend)
-                            , sendToDebugger updatedModel
-                            ]
+                        ( { m | history = updatedHistory, currentIndex = List.length updatedHistory }
+                        , delay 500 (BEtoFEDelayed clientId toFrontend)
                         )
                     else
-                        let
-                            updatedModel = { m | history = updatedHistory, currentIndex = List.length updatedHistory }
-                        in
-                        ( updatedModel
+                        ( { m | history = updatedHistory, currentIndex = List.length updatedHistory }
                         , Cmd.batch
                             [ send_ToFrontend
                                 { t = "ToFrontend", b = toFrontend |> Types.w3_encode_ToFrontend |> Wire.bytesEncode, s = "", c = clientId }
-                            , sendToDebugger updatedModel
                             ]
                         )
 
@@ -802,20 +711,13 @@ update msg m =
                                         m.history ++ [ newHistoryEntry ]
                             in
                             withDebugger <|
-                                let
-                                    updatedModel = 
-                                        { m 
-                                        | bem = newBem
-                                        , bemDirty = True
-                                        , history = updatedHistory
-                                        , currentIndex = List.length updatedHistory
-                                        }
-                                in
-                                ( updatedModel
-                                , Cmd.batch
-                                    [ Cmd.map BEMsg newBeCmds
-                                    , sendToDebugger updatedModel
-                                    ]
+                                ( { m 
+                                    | bem = newBem
+                                    , bemDirty = True
+                                    , history = updatedHistory
+                                    , currentIndex = List.length updatedHistory
+                                  }
+                                , Cmd.map BEMsg newBeCmds
                                 )
 
                         Nothing ->
@@ -836,65 +738,34 @@ update msg m =
                             userFrontendApp.updateFromBackend toFrontend m.fem
 
                         -- Update the activeFrontendModels with the new frontend model
-                        -- Always use our actual clientId as the key, regardless of what's in the model
                         updatedActiveFrontendModels =
                             Dict.insert m.clientId newFem m.activeFrontendModels
 
-                        -- Only the leader should record ToFrontend messages to avoid duplicates
-                        (newHistory, newIndex) =
-                            if m.nodeType == Leader then
-                                let
-                                    newHistoryEntry =
-                                        { kind = KindToFrontend
-                                        , msg = Debug.toString toFrontend
-                                        , frontendModels = Dict.toList updatedActiveFrontendModels
-                                        , bem = Just m.bem
-                                        , source = Nothing
-                                        , target = Just { sessionId = args.s, clientId = args.c }
-                                        , timestamp = 0
-                                        }
+                        newHistoryEntry =
+                            { kind = KindToFrontend
+                            , msg = Debug.toString toFrontend
+                            , frontendModels = Dict.toList updatedActiveFrontendModels
+                            , bem = if m.nodeType == Leader then Just m.bem else Nothing
+                            , source = Nothing
+                            , target = Just { sessionId = args.s, clientId = args.c }
+                            , timestamp = 0
+                            }
 
-                                    updatedHistory =
-                                        if m.currentIndex < List.length m.history then
-                                            -- If we're in the middle of history, truncate it
-                                            List.take m.currentIndex m.history ++ [ newHistoryEntry ]
-                                        else
-                                            m.history ++ [ newHistoryEntry ]
-                                in
-                                (updatedHistory, List.length updatedHistory)
+                        updatedHistory =
+                            if m.currentIndex < List.length m.history then
+                                -- If we're in the middle of history, truncate it
+                                List.take m.currentIndex m.history ++ [ newHistoryEntry ]
                             else
-                                -- Followers don't add to history, just maintain their current index
-                                (m.history, m.currentIndex)
+                                m.history ++ [ newHistoryEntry ]
                     in
                     withDebugger <|
-                        let
-                            updatedModel = 
-                                { m 
-                                | fem = storeFE m newFem
-                                , activeFrontendModels = updatedActiveFrontendModels
-                                , history = newHistory
-                                , currentIndex = newIndex
-                                }
-                        in
-                        ( updatedModel
-                        , Cmd.batch
-                            [ Cmd.map FEMsg newFeCmds
-                            -- If we're a follower, send our updated frontend model to the leader
-                            , if m.nodeType == Follower then
-                                sendFrontendModelUpdate
-                                    { t = "fmu"  -- Frontend Model Update
-                                    , s = m.sessionId
-                                    , c = m.clientId
-                                    , fem = Wire.bytesEncode (Types.w3_encode_FrontendModel newFem)
-                                    }
-                              else
-                                Cmd.none
-                            -- Update debugger if open and we're the leader
-                            , if m.nodeType == Leader then
-                                sendToDebugger updatedModel
-                              else
-                                Cmd.none
-                            ]
+                        ( { m 
+                            | fem = storeFE m newFem
+                            , activeFrontendModels = updatedActiveFrontendModels
+                            , history = updatedHistory
+                            , currentIndex = List.length updatedHistory
+                          }
+                        , Cmd.map FEMsg newFeCmds
                         )
 
                 Nothing ->
@@ -1339,71 +1210,28 @@ update msg m =
         --         ( m, Cmd.none )
         Noop ->
             ( m, Cmd.none )
-        
-        ReceivedTimeTravelState args ->
-            -- Only followers should process this (leader already has the state)
-            case m.nodeType of
-                Leader ->
-                    ( m, Cmd.none )
-                    
-                Follower ->
-                    -- Followers should jump to the same index in their history
-                    -- This will replay their local state to match the time travel position
-                    -- IMPORTANT: We must preserve our own clientId and not adopt another client's
-                    if args.index >= 0 && args.index < List.length m.history then
-                        update (JumpTo args.index) m
-                    else if args.index == -1 then
-                        -- Special case for init state
-                        update (JumpTo args.index) m
-                    else
-                        -- Index out of bounds - probably at latest, just re-enable interaction
-                        ( m
-                        , setClientInteractionEnabled (args.index >= List.length m.history - 1)
-                        )
 
         OpenDebugPage ->
             let
-                -- When opening debugger, automatically select the latest history entry
-                latestIndex = List.length m.history - 1
-                
                 entryToJson entry =
                     E.object
                         [ ( "kind", E.string (msgKindToString entry.kind) )
                         , ( "msg", E.string entry.msg )
-                        , ( "frontendModels", E.list (\(clientId, fem) -> E.list E.string [clientId, Debug.toString fem]) entry.frontendModels )
-                        , ( "bem", case entry.bem of
-                            Just bem -> E.string (Debug.toString bem)
-                            Nothing -> E.null
-                        )
-                        , ( "source", case entry.source of
-                            Just src -> E.object [ ("sessionId", E.string src.sessionId), ("clientId", E.string src.clientId) ]
-                            Nothing -> E.null
-                        )
-                        , ( "target", case entry.target of
-                            Just tgt -> E.object [ ("sessionId", E.string tgt.sessionId), ("clientId", E.string tgt.clientId) ]
-                            Nothing -> E.null
-                        )
-                        , ( "timestamp", E.int entry.timestamp )
                         ]
                 
                 frontendModelsToJson : List (String, FrontendModel) -> E.Value
                 frontendModelsToJson models =
-                    -- Note: We use the dictionary key as the authoritative clientId
-                    -- The clientId field inside the model might be incorrect
-                    E.list (\(actualClientId, fem) -> E.list E.string [actualClientId, Debug.toString fem]) models
+                    E.list (\(clientId, fem) -> E.list identity [E.string clientId, E.string (Debug.toString fem)]) models
                 
                 debugState = 
                     E.object
                         [ ( "history", E.list entryToJson m.history )
-                        , ( "currentIndex", E.int latestIndex )
+                        , ( "currentIndex", E.int m.currentIndex )
                         , ( "frontendModels", frontendModelsToJson (Dict.toList m.activeFrontendModels) )
                         , ( "bem", E.string (Debug.toString m.bem) )
-                        , ( "nodeType", E.string (if m.nodeType == Leader then "Leader" else "Follower") )
-                        , ( "clientId", E.string m.clientId )
-                        , ( "sessionId", E.string m.sessionId )
                         ]
             in
-            ( { m | debuggerWindowOpen = True, currentIndex = latestIndex }, openDebugWindow debugState )
+            ( m, openDebugWindow debugState )
 
         ToggleTimeTravel ->
             if m.timeTravelOpen then
@@ -1433,155 +1261,31 @@ update msg m =
                   }
                 , Cmd.none
                 )
-        
-        TimeTravelDragStart startX startY ->
-            ( { m | isDragging = True, dragStart = Just { x = startX, y = startY } }, Cmd.none )
-        
-        TimeTravelDragMove newX newY ->
-            case m.dragStart of
-                Just start ->
-                    let
-                        deltaX = newX - start.x
-                        deltaY = newY - start.y
-                        newPosition = 
-                            { x = m.timeTravelPosition.x + deltaX
-                            , y = m.timeTravelPosition.y + deltaY
-                            }
-                    in
-                    ( { m 
-                        | timeTravelPosition = newPosition
-                        , dragStart = Just { x = newX, y = newY }
-                      }
-                    , Cmd.none
-                    )
-                Nothing ->
-                    ( m, Cmd.none )
-        
-        TimeTravelDragEnd ->
-            ( { m | isDragging = False, dragStart = Nothing }, Cmd.none )
-        
-        TimeTravelResizeStart startWidth startHeight ->
-            ( { m | isResizing = True }, Cmd.none )
-        
-        TimeTravelResizeMove newX newY ->
-            if m.isResizing then
-                let
-                    minWidth = 400
-                    minHeight = 300
-                    newWidth = Basics.max minWidth (newX - m.timeTravelPosition.x)
-                    newHeight = Basics.max minHeight (newY - m.timeTravelPosition.y)
-                in
-                ( { m | timeTravelSize = { width = newWidth, height = newHeight } }, Cmd.none )
-            else
-                ( m, Cmd.none )
-        
-        TimeTravelResizeEnd ->
-            ( { m | isResizing = False }, Cmd.none )
 
         JumpTo index ->
-            if index == -1 then
-                -- Jump to initial state (before any history)
-                let
-                    ( initialFem, _ ) = userFrontendApp.init m.originalUrl m.originalKey
-                    ( initialBem, _ ) = userBackendApp.init
-                in
-                ( { m
-                    | fem = initialFem
-                    , bem = initialBem
-                    , activeFrontendModels = Dict.singleton m.clientId initialFem
-                    , currentIndex = -1
-                  }
-                , Cmd.batch
-                    [ if m.nodeType == Leader then
-                        -- Broadcast the time travel state to all clients
-                        broadcastTimeTravelState
-                            { t = "tts"  -- Time Travel State
-                            , index = -1
-                            , frontendModels = [[m.clientId, Debug.toString initialFem]]
-                            , bem = Debug.toString initialBem
-                            }
-                      else
-                        Cmd.none
-                    -- Disable interaction when not at latest
-                    , setClientInteractionEnabled False
-                    ]
-                )
-            else if index == List.length m.history - 1 then
-                -- Special case: jumping to the latest entry (present)
-                -- Use the current live models instead of the ones from history
-                ( { m
-                    | currentIndex = index
-                  }
-                , Cmd.batch
-                    [ if m.nodeType == Leader then
-                        -- Broadcast current live state
-                        broadcastTimeTravelState
-                            { t = "tts"
-                            , index = index
-                            , frontendModels = Dict.toList m.activeFrontendModels |> List.map (\(cid, fem) -> [cid, Debug.toString fem])
-                            , bem = Debug.toString m.bem
-                            }
-                      else
-                        Cmd.none
-                    -- Re-enable interaction since we're at the latest
-                    , setClientInteractionEnabled True
-                    ]
-                )
-            else if index >= 0 && index < List.length m.history then
+            if index >= 0 && index < List.length m.history then
                 case List.drop index m.history |> List.head of
                     Just entry ->
                         let
                             -- Get the current client's frontend model from the history entry
-                            -- Use the dictionary key (first element of tuple) to find our model
-                            -- NOTE: The clientId field inside the model might be wrong due to app bugs
-                            -- We always use the dictionary key as the authoritative client ID
                             newFem = 
                                 entry.frontendModels
-                                    |> List.filter (\(dictKey, _) -> dictKey == m.clientId)
+                                    |> List.filter (\(clientId, _) -> clientId == m.clientId)
                                     |> List.head
                                     |> Maybe.map Tuple.second
                                     |> Maybe.withDefault m.fem
                                     
                             -- Update activeFrontendModels with all models from the history entry
-                            -- The dictionary key is the authoritative clientId, not the one in the model
                             updatedActiveFrontendModels =
                                 Dict.fromList entry.frontendModels
-                            
-                            -- Get the backend model from history entry
-                            -- If it's Nothing (for non-leader messages), we need to find the last known backend state
-                            newBem =
-                                case entry.bem of
-                                    Just bem ->
-                                        bem
-                                    Nothing ->
-                                        -- Look backwards through history to find the last backend model
-                                        m.history
-                                            |> List.take index
-                                            |> List.reverse
-                                            |> List.filterMap .bem
-                                            |> List.head
-                                            |> Maybe.withDefault m.bem
                         in
                         ( { m
                             | fem = newFem
-                            , bem = newBem
+                            , bem = Maybe.withDefault m.bem entry.bem
                             , activeFrontendModels = updatedActiveFrontendModels
                             , currentIndex = index
                           }
-                        , Cmd.batch
-                            [ if m.nodeType == Leader then
-                                -- Broadcast the time travel state to all clients
-                                broadcastTimeTravelState
-                                    { t = "tts"  -- Time Travel State
-                                    , index = index
-                                    , frontendModels = entry.frontendModels |> List.map (\(cid, fem) -> [cid, Debug.toString fem])
-                                    , bem = Debug.toString newBem
-                                    }
-                              else
-                                Cmd.none
-                            -- Enable interaction only if we're at the latest
-                            , setClientInteractionEnabled (index == List.length m.history - 1)
-                            ]
+                        , Cmd.none
                         )
 
                     Nothing ->
@@ -1615,69 +1319,63 @@ update msg m =
                                 m.history ++ [ newHistoryEntry ]
                     in
                     withDebugger <|
-                        let
-                            updatedModel = 
-                                { m 
-                                | history = updatedHistory
-                                , currentIndex = List.length updatedHistory
-                                }
-                        in
-                        ( updatedModel
-                        , sendToDebugger updatedModel
+                        ( { m 
+                            | history = updatedHistory
+                            , currentIndex = List.length updatedHistory
+                          }
+                        , Cmd.none
                         )
 
-        ReceivedFrontendModelUpdate args ->
-            -- Only the Leader should handle frontend model updates from other clients
-            case m.nodeType of
-                Follower ->
-                    ( m, Cmd.none )
-                
-                Leader ->
-                    case Wire.bytesDecode Types.w3_decode_FrontendModel args.fem of
-                        Just frontendModel ->
-                            let
-                                -- Update the activeFrontendModels with the received model
-                                -- IMPORTANT: We use args.c as the key, which should match the clientId in the model
-                                -- The clientId field inside the model might be wrong due to app bugs
-                                updatedActiveFrontendModels =
-                                    Dict.insert args.c frontendModel m.activeFrontendModels
-                                    
-                                -- If debugger is open, send updated state
-                                debuggerCmd =
-                                    if m.debuggerWindowOpen then
-                                        let
-                                            frontendModelsToJson models =
-                                                -- Use dictionary key as authoritative clientId
-                                                E.list (\(actualClientId, fem) -> E.list E.string [actualClientId, Debug.toString fem]) models
-                                            
-                                            entryToJson entry =
-                                                E.object
-                                                    [ ( "kind", E.string (msgKindToString entry.kind) )
-                                                    , ( "msg", E.string entry.msg )
-                                                    ]
-                                            
-                                            debugState = 
-                                                E.object
-                                                    [ ( "history", E.list entryToJson m.history )
-                                                    , ( "currentIndex", E.int m.currentIndex )
-                                                    , ( "frontendModels", frontendModelsToJson (Dict.toList updatedActiveFrontendModels) )
-                                                    , ( "bem", E.string (Debug.toString m.bem) )
-                                                    ]
-                                        in
-                                        Cmd.none
-                                    else
-                                        Cmd.none
-                            in
-                            ( { m | activeFrontendModels = updatedActiveFrontendModels }
-                            , debuggerCmd
-                            )
-                        
-                        Nothing ->
-                            let
-                                _ = Debug.log "Failed to decode frontend model update" args
-                            in
-                            ( m, Cmd.none )
+        TimeTravelDragStart x y ->
+            let
+                dragStartOffset =
+                    { x = x - m.timeTravelPosition.x
+                    , y = y - m.timeTravelPosition.y
+                    }
+            in
+            ( { m | isDragging = True, dragStart = Just dragStartOffset }, Cmd.none )
 
+        TimeTravelDragMove x y ->
+            case m.dragStart of
+                Just offset ->
+                    let
+                        newPosition =
+                            { x = x - offset.x
+                            , y = y - offset.y
+                            }
+                    in
+                    ( { m | timeTravelPosition = newPosition }, Cmd.none )
+                Nothing ->
+                    ( m, Cmd.none )
+
+        TimeTravelDragEnd ->
+            ( { m | isDragging = False, dragStart = Nothing }, Cmd.none )
+
+        TimeTravelResizeStart x y ->
+            ( { m | isResizing = True, dragStart = Just { x = x, y = y } }, Cmd.none )
+
+        TimeTravelResizeMove x y ->
+            case m.dragStart of
+                Just start ->
+                    let
+                        dx = x - start.x
+                        dy = y - start.y
+                        newSize = 
+                            { width = Basics.max 400 (m.timeTravelSize.width + dx)
+                            , height = Basics.max 300 (m.timeTravelSize.height + dy)
+                            }
+                    in
+                    ( { m 
+                        | timeTravelSize = newSize
+                        , dragStart = Just { x = x, y = y }
+                      }
+                    , Cmd.none
+                    )
+                Nothing ->
+                    ( m, Cmd.none )
+
+        TimeTravelResizeEnd ->
+            ( { m | isResizing = False, dragStart = Nothing }, Cmd.none )
         
         DebuggerMessage value ->
             case D.decodeValue (D.field "type" D.string) value of
@@ -1713,9 +1411,6 @@ subscriptions { nodeType, fem, bem, bemDirty } =
         , onDisconnection OnDisconnection
         , LD.every (10 * 60 * 1000) VersionCheck
         , debuggerMessage DebuggerMessage
-        , receiveFrontendModelUpdate ReceivedFrontendModelUpdate
-        , receiveFrontendMessage ReceivedFrontendMsg
-        , receiveTimeTravelState ReceivedTimeTravelState
         ]
 
 
@@ -1748,220 +1443,6 @@ yForLocation location =
         BottomLeft ->
             style "bottom" "5px"
 
-
--- Simple HTML-based timeline (no SVG dependencies needed)
-simpleTimelineView : Model -> Html Msg
-simpleTimelineView model =
-    let
-        maxEntries = 20  -- Limit for performance
-        recentHistory = List.take maxEntries (List.reverse model.history) |> List.reverse
-        totalEntries = List.length model.history
-    in
-    div
-        [ style "background-color" "#1e1e1e"
-        , style "padding" "12px"
-        , style "border-bottom" "1px solid #444"
-        , style "height" "120px"
-        , style "overflow-x" "auto"
-        ]
-        [ div [ style "color" "#ccc", style "font-size" "12px", style "margin-bottom" "8px" ]
-            [ text ("Timeline (showing last " ++ String.fromInt (List.length recentHistory) ++ " of " ++ String.fromInt totalEntries ++ " messages)") ]
-        , div
-            [ style "display" "flex"
-            , style "gap" "4px"
-            , style "align-items" "end"
-            , style "height" "80px"
-            , style "min-width" "fit-content"
-            ]
-            (List.indexedMap (timelineItem model.currentIndex (totalEntries - List.length recentHistory)) recentHistory)
-        ]
-
-timelineItem : Int -> Int -> Int -> HistoryEntry -> Html Msg
-timelineItem currentIndex offset index entry =
-    let
-        actualIndex = offset + index
-        isSelected = currentIndex == actualIndex
-        kindColor = msgKindColor entry.kind
-        height = if isSelected then "60px" else "40px"
-        opacity = if isSelected then "1" else "0.7"
-    in
-    div
-        [ style "width" "8px"
-        , style "height" height
-        , style "background-color" kindColor
-        , style "opacity" opacity
-        , style "cursor" "pointer"
-        , style "border-radius" "2px"
-        , style "transition" "all 0.2s ease"
-        , style "position" "relative"
-        , onClick (JumpTo actualIndex)
-        , title (msgKindToString entry.kind ++ ": " ++ String.left 50 entry.msg)
-        ]
-        [ if isSelected then
-            div
-                [ style "position" "absolute"
-                , style "bottom" "100%"
-                , style "left" "50%"
-                , style "transform" "translateX(-50%)"
-                , style "background-color" "#333"
-                , style "color" "white"
-                , style "padding" "4px 8px"
-                , style "border-radius" "4px"
-                , style "font-size" "10px"
-                , style "white-space" "nowrap"
-                , style "margin-bottom" "4px"
-                ]
-                [ text (String.fromInt actualIndex) ]
-          else
-            text ""
-        ]
-
-timeTravelPopup : Model -> Html Msg
-timeTravelPopup model =
-    let
-        historyListHeight = model.timeTravelSize.height - 220  -- Reserve space for timeline and controls
-    in
-    -- Full screen overlay with backdrop
-    div
-        [ style "position" "fixed"
-        , style "top" "0"
-        , style "left" "0"
-        , style "width" "100vw"
-        , style "height" "100vh"
-        , style "background-color" "rgba(0, 0, 0, 0.5)"
-        , style "backdrop-filter" "blur(3px)"
-        , style "-webkit-backdrop-filter" "blur(3px)"
-        , style "z-index" "10000"
-        , style "display" "flex"
-        , style "justify-content" "center"
-        , style "align-items" "center"
-        , style "font-family" "system-ui, -apple-system, sans-serif"
-        , onClick ToggleTimeTravel  -- Click outside to close
-        ]
-        [ -- The actual popup window
-          div
-            [ style "width" (String.fromFloat model.timeTravelSize.width ++ "px")
-            , style "height" (String.fromFloat model.timeTravelSize.height ++ "px")
-            , style "background-color" "#1a1a1a"
-            , style "color" "white"
-            , style "border" "1px solid #444"
-            , style "border-radius" "8px"
-            , style "overflow" "hidden"
-            , style "display" "flex"
-            , style "flex-direction" "column"
-            , style "box-shadow" "0 20px 40px rgba(0, 0, 0, 0.8)"
-            -- Prevent clicks inside popup from closing it by not adding onClick here
-            ]
-        [ -- Header with drag handle and close button
-          div
-            [ style "background-color" "#2a2a2a"
-            , style "padding" "8px 12px"
-            , style "border-bottom" "1px solid #444"
-            , style "display" "flex"
-            , style "justify-content" "space-between"
-            , style "align-items" "center"
-            ]
-            [ h3 [ style "margin" "0", style "color" "#4CAF50" ] [ text "🐛 Time Travel Debugger" ]
-            , button
-                [ onClick ToggleTimeTravel
-                , style "background" "none"
-                , style "border" "none"
-                , style "color" "#ccc"
-                , style "cursor" "pointer"
-                , style "font-size" "18px"
-                , style "padding" "0"
-                , style "width" "20px"
-                , style "height" "20px"
-                ]
-                [ text "×" ]
-            ]
-        , -- Timeline visualization
-          simpleTimelineView model
-        , -- History list
-          div
-            [ style "flex" "1"
-            , style "overflow-y" "auto"
-            , style "padding" "8px"
-            ]
-            [ h4 [ style "margin" "0 0 8px 0", style "color" "#ccc" ] 
-                [ text ("History (" ++ String.fromInt (List.length model.history) ++ " messages)") ]
-            , div []
-                (List.indexedMap (historyItem model.currentIndex) model.history)
-            ]
-        , -- Frontend models display
-          div
-            [ style "background-color" "#2a2a2a"
-            , style "border-top" "1px solid #444"
-            , style "padding" "8px"
-            , style "max-height" "200px"
-            , style "overflow-y" "auto"
-            ]
-            [ h4 [ style "margin" "0 0 8px 0", style "color" "#ccc" ] [ text "Frontend Models" ]
-            , div []
-                (Dict.toList model.activeFrontendModels
-                    |> List.map (\(clientId, fem) ->
-                        div
-                            [ style "margin-bottom" "8px"
-                            , style "background-color" "#333"
-                            , style "border-radius" "4px"
-                            , style "padding" "8px"
-                            ]
-                            [ h5 [ style "margin" "0 0 4px 0", style "color" "#4CAF50" ] 
-                                [ text ("Client: " ++ clientId) ]
-                            , pre 
-                                [ style "margin" "0"
-                                , style "font-size" "11px"
-                                , style "white-space" "pre-wrap"
-                                , style "color" "#ddd"
-                                ] 
-                                [ text (Debug.toString fem) ]
-                            ]
-                    )
-                )
-            ]
-            ] -- End of popup window div
-        ] -- End of overlay div
-
-historyItem : Int -> Int -> HistoryEntry -> Html Msg
-historyItem currentIndex index entry =
-    let
-        isSelected = currentIndex == index
-        backgroundColor = if isSelected then "#0066cc" else "#333"
-        kindColor = msgKindColor entry.kind
-    in
-    div
-        [ style "padding" "8px"
-        , style "margin" "2px 0"
-        , style "background-color" backgroundColor
-        , style "border-radius" "4px"
-        , style "cursor" "pointer"
-        , style "border-left" ("3px solid " ++ kindColor)
-        , onClick (JumpTo index)
-        , onMouseEnter (JumpTo index)  -- Optional: hover to preview
-        ]
-        [ div [ style "font-weight" "bold", style "color" kindColor ]
-            [ text ("[" ++ String.fromInt index ++ "] " ++ msgKindToString entry.kind) ]
-        , div [ style "font-size" "12px", style "color" "#ccc", style "margin-top" "2px" ]
-            [ text (String.left 100 entry.msg ++ if String.length entry.msg > 100 then "..." else "") ]
-        ]
-
-msgKindColor : MsgKind -> String  
-msgKindColor kind =
-    case kind of
-        KindInit -> purple
-        KindFrontend -> green
-        KindBackend -> blue
-        KindToFrontend -> yellow
-        KindToBackend -> red
-
--- Mouse event decoders for drag and resize
-onMouseDown : (Float -> Float -> Msg) -> Attribute Msg
-onMouseDown tagger =
-    Html.Events.on "mousedown" 
-        (D.map2 tagger
-            (D.field "clientX" D.float)
-            (D.field "clientY" D.float)
-        )
 
 lamderaUI :
     DevBar
@@ -2613,10 +2094,6 @@ yellow =
     "#FFCB64"
 
 
-purple =
-    "#9966CC"
-
-
 darkYellow =
     "#C98F1B"
 
@@ -2856,3 +2333,347 @@ justs =
 --             Ok text
 
 
+renderTimeTravelUi : Model -> Html Msg
+renderTimeTravelUi model =
+    let
+        indexedHistory =
+            List.indexedMap (\i entry -> ( i, entry )) model.history
+
+        kindColor kind =
+            case kind of
+                KindFrontend ->
+                    green
+
+                KindBackend ->
+                    blue
+
+                KindToFrontend ->
+                    yellow
+
+                KindToBackend ->
+                    red
+
+        frontendInfo entry =
+            case ( entry.source, entry.target ) of
+                ( Just source, Nothing ) ->
+                    " (from " ++ source.clientId ++ ")"
+
+                ( Nothing, Just target ) ->
+                    " (to " ++ target.clientId ++ ")"
+
+                ( Just source, Just target ) ->
+                    " (from " ++ source.clientId ++ " to " ++ target.clientId ++ ")"
+
+                ( Nothing, Nothing ) ->
+                    ""
+
+        historyEntry ( i, entry ) =
+            div
+                [ style "padding" "4px 8px"
+                , style "margin" "2px 0"
+                , style "cursor" "pointer"
+                , style "background-color" (if i == model.currentIndex then "#444" else "#333")
+                , style "border-left" ("3px solid " ++ kindColor entry.kind)
+                , onClick (JumpTo i)
+                ]
+                [ div [ style "font-size" "12px" ]
+                    [ text (String.fromInt i ++ ": " ++ entry.msg ++ frontendInfo entry) ]
+                ]
+
+        currentEntry =
+            List.drop model.currentIndex model.history
+                |> List.head
+                |> Maybe.withDefault 
+                    { kind = KindFrontend
+                    , msg = "Initial State"
+                    , frontendModels = Dict.toList model.activeFrontendModels
+                    , bem = Just model.bem
+                    , source = Nothing
+                    , target = Nothing
+                    , timestamp = 0
+                    }
+
+        -- Function to pretty print JSON-like data
+        prettyPrint str =
+            str
+                |> String.lines
+                |> List.map String.trim
+                |> String.join "\n"
+                |> (\s -> 
+                    if String.startsWith "{" s then
+                        "{\n  " ++ (String.dropLeft 1 (String.dropRight 1 s) |> String.replace "," ",\n  ") ++ "\n}"
+                    else
+                        s
+                   )
+
+        -- Add initial state entry at the top of history
+        historyWithInitial =
+            ( -1
+            , { kind = KindFrontend
+              , msg = "Initial State"
+              , frontendModels = Dict.toList model.activeFrontendModels
+              , bem = Just model.bem
+              , source = Nothing
+              , target = Nothing
+              , timestamp = 0
+              }
+            ) :: indexedHistory
+
+        -- Add new helper functions for dragging and resizing
+        onMouseDown : (Float -> Float -> msg) -> Html.Attribute msg
+        onMouseDown msg =
+            Html.Events.on "mousedown" 
+                (D.map2 msg
+                    (D.field "clientX" D.float)
+                    (D.field "clientY" D.float)
+                )
+
+        -- Default size if not set
+        size =
+            if model.timeTravelSize.width == 0 then
+                { width = 800, height = 600 }
+            else
+                model.timeTravelSize
+
+        -- Default position if not set
+        position =
+            if model.timeTravelPosition.x == 0 && model.timeTravelPosition.y == 0 then
+                { x = (toFloat (round ((toFloat windowWidth) / 2)) - (size.width / 2))
+                , y = (toFloat (round ((toFloat windowHeight) / 2)) - (size.height / 2))
+                }
+            else
+                model.timeTravelPosition
+
+        windowWidth = 1920  -- You might want to make this dynamic
+        windowHeight = 1080  -- You might want to make this dynamic
+    in
+    div
+        [ style "position" "fixed"
+        , style "top" "0"
+        , style "left" "0"
+        , style "right" "0"
+        , style "bottom" "0"
+        , style "z-index" "2147483647"
+        , style "background-color" "rgba(0, 0, 0, 0.5)"
+        , if model.isDragging || model.isResizing then
+            Html.Events.on "mousemove" 
+                (D.map2 
+                    (if model.isDragging then TimeTravelDragMove else TimeTravelResizeMove)
+                    (D.field "clientX" D.float)
+                    (D.field "clientY" D.float)
+                )
+          else
+            style "" ""
+        , if model.isDragging || model.isResizing then
+            Html.Events.on "mouseup" (D.succeed (if model.isDragging then TimeTravelDragEnd else TimeTravelResizeEnd))
+          else
+            style "" ""
+        ]
+        [ div 
+            [ style "position" "absolute"
+            , style "left" (String.fromFloat position.x ++ "px")
+            , style "top" (String.fromFloat position.y ++ "px")
+            , style "width" (String.fromFloat size.width ++ "px")
+            , style "height" (String.fromFloat size.height ++ "px")
+            , style "background-color" charcoal
+            , style "color" white
+            , style "border-radius" "6px"
+            , style "box-shadow" "0 4px 12px rgba(0, 0, 0, 0.5)"
+            , style "overflow" "hidden"
+            ]
+            [ div 
+                [ style "display" "flex"
+                , style "justify-content" "space-between"
+                , style "align-items" "center"
+                , style "padding" "0.25rem"
+                , style "margin-bottom" "0.25rem"
+                , style "border-bottom" "1px solid #444"
+                , style "cursor" "move"
+                , onMouseDown TimeTravelDragStart
+                ]
+                [ h3 [ style "margin" "0", style "font-size" "16px" ] [ text "Time Travel Debugger" ]
+                , button
+                    [ onClick ToggleTimeTravel
+                    , style "background" "none"
+                    , style "border" "none"
+                    , style "color" white
+                    , style "cursor" "pointer"
+                    , style "font-size" "18px"
+                    , style "padding" "2px 6px"
+                    ]
+                    [ text "×" ]
+                ]
+            , div 
+                [ style "display" "flex"
+                , style "overflow" "hidden"
+                , style "height" "calc(100% - 2rem)"
+                ] 
+                [ div 
+                    [ style "width" "50%"
+                    , style "overflow" "hidden"
+                    , style "display" "flex"
+                    , style "flex-direction" "column"
+                    ] 
+                    [ div 
+                        [ style "margin-bottom" "6px"
+                        , style "padding" "3px 6px"
+                        , style "background-color" "#333"
+                        , style "border-radius" "4px"
+                        , style "font-size" "11px"
+                        ]
+                        [ text ("Current index: " ++ String.fromInt model.currentIndex)
+                        , text (" / " ++ String.fromInt (List.length model.history - 1))
+                        ]
+                    , div 
+                        [ style "flex" "1"
+                        , style "overflow-y" "auto"
+                        , style "overflow-x" "hidden"
+                        , style "min-height" "0"
+                        ] 
+                        (List.map historyEntry historyWithInitial)
+                    ]
+                , div 
+                    [ style "width" "50%"
+                    , style "padding-left" "1rem"
+                    , style "overflow" "hidden"
+                    , style "display" "flex"
+                    , style "flex-direction" "column"
+                    ] 
+                    [ h4 [ style "margin" "0 0 0.25rem 0", style "font-size" "14px" ] [ text "Backend Model" ]
+                    , pre 
+                        [ style "margin" "0 0 0.75rem 0"
+                        , style "background-color" "#333"
+                        , style "padding" "0.4rem"
+                        , style "border-radius" "4px"
+                        , style "overflow-x" "auto"
+                        , style "font-size" "11px"
+                        ] 
+                        [ text (prettyPrint (Debug.toString (Maybe.withDefault model.bem currentEntry.bem))) ]
+                    , h4 [ style "margin" "0 0 0.25rem 0", style "font-size" "14px" ] [ text "Frontend Models" ]
+                    , div 
+                        [ style "flex" "1"
+                        , style "overflow-y" "auto"
+                        , style "overflow-x" "hidden"
+                        , style "min-height" "0"
+                        ]
+                        (List.map
+                            (\(clientId, fem) ->
+                                div [ style "margin-bottom" "1rem" ]
+                                    [ div [ style "font-size" "0.7em", style "color" "#999", style "margin-bottom" "0.2rem" ]
+                                        [ text ("Client: " ++ clientId ++ if clientId == model.clientId then " (current)" else "") ]
+                                    , pre 
+                                        [ style "margin" "0"
+                                        , style "background-color" "#333"
+                                        , style "padding" "0.4rem"
+                                        , style "border-radius" "4px"
+                                        , style "overflow-x" "auto"
+                                        , style "font-size" "11px"
+                                        ] 
+                                        [ text (prettyPrint (Debug.toString fem)) ]
+                                    ]
+                            )
+                            (currentEntry.frontendModels
+                                |> List.append
+                                    (List.take (model.currentIndex + 1) model.history
+                                        |> List.concatMap .frontendModels
+                                    )
+                                        |> List.reverse
+                                    )
+                                |> List.foldl 
+                                    (\(clientId, fem) acc ->
+                                        if List.any (\(existingId, _) -> existingId == clientId) acc then
+                                            acc
+                                        else
+                                            (clientId, fem) :: acc
+                                    )
+                                    []
+                            )
+                        )
+                    ]
+                ]
+            , div
+                [ style "position" "absolute"
+                , style "right" "0"
+                , style "bottom" "0"
+                , style "width" "20px"
+                , style "height" "20px"
+                , style "cursor" "se-resize"
+                , style "background" "linear-gradient(135deg, transparent 50%, #666 50%)"
+                , onMouseDown TimeTravelResizeStart
+                ]
+                []
+            ]
+        ]
+
+-- Add near the other ports
+port openDebuggerWindow : { width : Int, height : Int } -> Cmd msg
+port closeDebuggerWindow : () -> Cmd msg
+port debuggerWindowClosed : (() -> msg) -> Sub msg
+port updateDebugger : { history : List { kind : String, msg : String, source : Maybe { sessionId : String, clientId : String }, target : Maybe { sessionId : String, clientId : String }, timestamp : Int }, currentIndex : Int } -> Cmd msg
+
+-- Helper function to convert HistoryEntry to JSON-compatible format
+historyToJson : HistoryEntry -> { kind : String, msg : String, source : Maybe { sessionId : String, clientId : String }, target : Maybe { sessionId : String, clientId : String }, timestamp : Int }
+historyToJson entry =
+    { kind = case entry.kind of
+        KindFrontend -> "frontend"
+        KindBackend -> "backend"
+        KindToFrontend -> "toFrontend"
+        KindToBackend -> "toBackend"
+    , msg = entry.msg
+    , source = entry.source
+    , target = entry.target
+    , timestamp = entry.timestamp
+    }
+
+-- Helper function to send updates to debugger window
+sendToDebugger : Model -> Cmd msg
+sendToDebugger model =
+    if model.debuggerWindowOpen then
+        updateDebugger 
+            { history = List.map historyToJson model.history
+            , currentIndex = model.currentIndex
+            }
+    else
+        Cmd.none
+
+-- Update the view function to send content to debugger window
+view : Model -> Browser.Document Msg
+view model =
+    let
+        { title, body } =
+            userFrontendApp.view model.fem
+    in
+    { title = title
+    , body =
+        List.map (Html.map FEMsg) body
+        ++ lamderaUI model.devbar model.nodeType model
+    }
+
+devBar : Model -> Html Msg
+devBar model =
+    div
+        [ style "position" "fixed"
+        , style "bottom" "0"
+        , style "right" "0"
+        , style "z-index" "1000"
+        ]
+        [ div
+            [ style "background-color" "#1e1e1e"
+            , style "color" "white"
+            , style "padding" "8px"
+            , style "border-radius" "4px"
+            , style "margin" "8px"
+            ]
+            [ text (nodeTypeToString model.nodeType)
+            , text " | "
+            , button
+                [ onClick OpenDebugPage
+                , style "background" "none"
+                , style "border" "none"
+                , style "color" "white"
+                , style "cursor" "pointer"
+                , style "padding" "4px 8px"
+                ]
+                [ text ("Time Travel (" ++ String.fromInt (List.length model.history) ++ ")") ]
+            ]
+        ]

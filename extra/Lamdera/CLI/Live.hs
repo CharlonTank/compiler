@@ -308,6 +308,21 @@ serveWebsocket root (mClients, mLeader, mChan, beState) =
                         liftIO $ writeBChan mChan text
                         pure ()
 
+                    else if T.isPrefixOf "{\"t\":\"fmu\"," text
+                      then do
+                        -- Frontend Model Update - forward to leader only
+                        sendToLeader mClients mLeader (\l -> pure text)
+
+                    else if T.isPrefixOf "{\"t\":\"fm\"," text
+                      then do
+                        -- Frontend Message - forward to leader only
+                        sendToLeader mClients mLeader (\l -> pure text)
+
+                    else if T.isPrefixOf "{\"t\":\"tts\"," text
+                      then do
+                        -- Time Travel State - broadcast to all clients
+                        SocketServer.broadcastImpl mClients text
+
                     else
                       SocketServer.broadcastImpl mClients text
 
@@ -790,4 +805,4 @@ passOnIndex pwd =
       pure ()
 
 
-x = 1735578445
+x = 1735578454

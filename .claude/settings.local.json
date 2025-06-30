@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew install:*)",
+      "Bash(git submodule:*)",
+      "Bash(rm:*)",
+      "Bash(cp:*)",
+      "Bash(sed:*)",
+      "Bash(stack build:*)",
+      "Bash(~/.local/bin/lamdera:*)",
+      "Bash(git rebase:*)",
+      "Bash(git stash:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(ghcup install:*)",
+      "Bash(ghcup set:*)",
+      "Bash(export:*)",
+      "Bash(stack install:*)",
+      "Bash(npx esbuild:*)",
+      "Bash(lamdera make:*)",
+      "Bash(elm make:*)",
+      "Bash(curl:*)",
+      "WebFetch(domain:localhost)",
+      "Bash(find:*)",
+      "Bash(true)",
+      "Bash(git add:*)",
+      "Bash(rg:*)",
+      "Bash(esbuild:*)",
+      "Bash(mkdir:*)",
+      "Bash(npm run build:*)",
+      "Bash(git commit:*)"
+    ],
+    "deny": []
+  }
+}
